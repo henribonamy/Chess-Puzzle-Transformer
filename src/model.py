@@ -1,13 +1,12 @@
 import math
-from os import supports_bytes_environ
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 EMBED_DIM = 1024
-# LENGTH OF FEN - TBD
-BLOCK_SIZE = 77
+BLOCK_SIZE = 84
+VOCAB_SIZE = 41
 
 
 class GLU(nn.Module):
@@ -84,8 +83,8 @@ class Block(nn.Module):
         self.mlpf = lambda x: m.dropout(m.c_proj(m.act(m.c_fc(x))))  # MLP forward
 
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlpf(self.ln_2(x))
+        x = self.ln_1(x + self.attn(x))
+        x = self.ln_2(x + self.mlpf(x))
         return x
 
 
@@ -94,11 +93,48 @@ class AutoRegressiveTransformer(nn.Module):
         super().__init__()
         self.transformer = nn.ModuleDict(
             dict(
-                wte=nn.Embedding(20, EMBED_DIM),
+                wte=nn.Embedding(VOCAB_SIZE, EMBED_DIM),
                 wpe=nn.Embedding(BLOCK_SIZE, EMBED_DIM),
                 drop=nn.Dropout(0.1),
-                h=nn.ModuleList([Block(self, 8) for _ in range(16)]),
+                h=nn.ModuleList([Block(8) for _ in range(16)]),
                 ln_f=nn.LayerNorm(EMBED_DIM),
             )
         )
-        self.lm_head = nn.Linear(EMBED_DIM, 20, bias=False)
+        self.lm_head = nn.Linear(EMBED_DIM, VOCAB_SIZE, bias=False)
+
+        self.apply(self._init_weights)
+
+        n_params = sum(p.numel() for p in self.transformer.parameters())
+        print("number of parameters: %.2fM" % (n_params / 1e6,))
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        elif isinstance(module, nn.LayerNorm):
+            torch.nn.init.zeros_(module.bias)
+            torch.nn.init.ones_(module.weight)
+
+    def forward(self, idx, targets=None):
+        device = idx.device
+        seq_length = idx.shape[1]
+        pos = torch.arange(0, seq_length, dtype=torch.long, device=device).unsqueeze(0)
+
+        tok_emb = self.transformer.wte(idx)
+        pos_emb = self.transformer.wpe(pos)
+        x = self.transformer.drop(tok_emb + pos_emb)
+        for block in self.transformer.h:
+            x = block(x)
+        x = self.transformer.ln_f(x)
+        logits = self.lm_head(x)
+
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-1
+            )
+
+        return logits, loss
