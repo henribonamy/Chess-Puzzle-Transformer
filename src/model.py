@@ -105,7 +105,7 @@ class AutoRegressiveTransformer(nn.Module):
         self.apply(self._init_weights)
 
         n_params = sum(p.numel() for p in self.transformer.parameters())
-        print("number of parameters: %.2fM" % (n_params / 1e6,))
+        print("Model Parameter Count: %.2fM" % (n_params / 1e6,))
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -138,3 +138,18 @@ class AutoRegressiveTransformer(nn.Module):
             )
 
         return logits, loss
+
+    @torch.no_grad()
+    def generate(self, idx, max_new_tokens, temperature=1.0):
+        self.eval()
+
+        for _ in range(max_new_tokens):
+            idx_cond = idx if idx.size(1) <= BLOCK_SIZE else idx[:, -BLOCK_SIZE:]
+            logits, _ = self(idx_cond)
+            logits = logits[:, -1, :] / temperature
+            probs = F.softmax(logits, dim=-1)
+            idx_next = torch.multinomial(probs, num_samples=1)
+            idx = torch.cat((idx, idx_next), dim=1)
+
+        self.train()
+        return idx
