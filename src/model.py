@@ -153,3 +153,66 @@ class AutoRegressiveTransformer(nn.Module):
 
         self.train()
         return idx
+
+    def get_logits(self, idx):
+        device = idx.device
+        seq_length = idx.shape[1]
+        pos = torch.arange(0, seq_length, dtype=torch.long, device=device).unsqueeze(0)
+
+        tok_emb = self.transformer.wte(idx)
+        pos_emb = self.transformer.wpe(pos)
+        x = self.transformer.drop(tok_emb + pos_emb)
+        for block in self.transformer.h:
+            x = block(x)
+        x = self.transformer.ln_f(x)
+        logits = self.lm_head(x)
+        return logits
+
+    def compute_log_probs(self, sequences):
+        logits = self.get_logits(sequences[:, :-1])  
+        log_probs_all = F.log_softmax(logits, dim=-1)  
+        targets = sequences[:, 1:]
+        log_probs = torch.gather(
+            log_probs_all, 
+            dim=-1, 
+            index=targets.unsqueeze(-1)
+        ).squeeze(-1)
+        
+        return log_probs
+
+    def compute_sequence_log_prob(self, sequences):
+        token_log_probs = self.compute_log_probs(sequences) 
+        return token_log_probs.sum(dim=-1)
+
+    def compute_entropy(self, sequences):
+        logits = self.get_logits(sequences[:, :-1])
+        probs = F.softmax(logits, dim=-1)
+        log_probs = F.log_softmax(logits, dim=-1)
+        token_entropy = -(probs * log_probs).sum(dim=-1) 
+        return token_entropy.mean(dim=-1)
+
+    def generate_with_log_probs(self, idx, max_new_tokens, temperature=1.0):
+        self.eval()
+        device = idx.device
+        batch_size = idx.shape[0]
+        
+        all_log_probs = []
+        
+        for _ in range(max_new_tokens):
+            idx_cond = idx if idx.size(1) <= BLOCK_SIZE else idx[:, -BLOCK_SIZE:]
+            logits = self.get_logits(idx_cond)
+            logits = logits[:, -1, :] / temperature  
+            log_probs_step = F.log_softmax(logits, dim=-1)  
+            probs = torch.exp(log_probs_step)
+            idx_next = torch.multinomial(probs, num_samples=1)
+            log_prob_selected = torch.gather(
+                log_probs_step, 
+                dim=-1, 
+                index=idx_next
+            ).squeeze(-1)
+            all_log_probs.append(log_prob_selected)
+            idx = torch.cat((idx, idx_next), dim=1)
+        
+        self.train()
+        log_probs = torch.stack(all_log_probs, dim=1)
+        return idx, log_probs
