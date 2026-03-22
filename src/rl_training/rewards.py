@@ -1,6 +1,10 @@
+import math
+
 import torch
 import chess
 import chess.engine
+
+from replay_buffer import ReplayBuffer
 
 
 def extract_board_position(fen: str) -> str:
@@ -11,77 +15,142 @@ def extract_board_position(fen: str) -> str:
     return " ".join(parts[:4])
 
 
-def realism_reward(fens: list[str], engine: chess.engine.SimpleEngine) -> torch.Tensor:
-    """Return per-FEN realism scores in [0, 1] based on Stockfish evaluation."""
-    scores: list[float] = []
-    for fen in fens:
-        try:
-            board = chess.Board(fen)
-        except Exception:
-            scores.append(0.0)
-            continue
-
-        if board.is_game_over():
-            scores.append(0.0)
-            continue
-
-        try:
-            info = engine.analyse(board, chess.engine.Limit(depth=5))
-        except Exception:
-            scores.append(0.0)
-            continue
-
-        score = info["score"].relative
-        if score.is_mate():
-            mate_n = score.mate()
-            if mate_n is None or mate_n <= 0:
-                scores.append(0.0)
-            else:
-                scores.append(0.8)
-        else:
-            cp = score.score()
-            if cp is None:
-                scores.append(0.0)
-            elif abs(cp) < 900:
-                scores.append(1.0 - abs(cp) / 900.0)
-            else:
-                scores.append(0.0)
-
-    return torch.tensor(scores, dtype=torch.float32)
+def is_valid_fen(fen: str) -> bool:
+    """Return True if the FEN string represents a legal chess position."""
+    try:
+        chess.Board(fen)
+        return True
+    except Exception:
+        return False
 
 
-def uniqueness_reward(fens: list[str], board_position_set: set[str]) -> torch.Tensor:
-    """Return 1.0 for positions not in the training set, 0.0 for duplicates."""
-    scores = [
-        0.0 if extract_board_position(fen) in board_position_set else 1.0
-        for fen in fens
-    ]
-    return torch.tensor(scores, dtype=torch.float32)
+def is_realistic_piece_count(fen: str) -> bool:
+    """Return False if any side has >16 total pieces, >8 pawns, or != 1 king."""
+    try:
+        board = chess.Board(fen)
+    except Exception:
+        return False
+    for color in (chess.WHITE, chess.BLACK):
+        total = len(board.pieces(chess.PAWN, color) | board.pieces(chess.KNIGHT, color) |
+                    board.pieces(chess.BISHOP, color) | board.pieces(chess.ROOK, color) |
+                    board.pieces(chess.QUEEN, color) | board.pieces(chess.KING, color))
+        if total > 16:
+            return False
+        if len(board.pieces(chess.PAWN, color)) > 8:
+            return False
+        if len(board.pieces(chess.KING, color)) != 1:
+            return False
+    return True
 
 
-def diversity_reward(fens: list[str]) -> torch.Tensor:
-    """Return per-sample diversity scores based on pairwise uniqueness within the batch."""
-    n = len(fens)
-    if n <= 1:
-        return torch.ones(n, dtype=torch.float32)
-
-    board_positions = [extract_board_position(fen) for fen in fens]
-    scores = [
-        sum(1 for j in range(n) if j != i and board_positions[j] != board_positions[i]) / (n - 1)
-        for i in range(n)
-    ]
-    return torch.tensor(scores, dtype=torch.float32)
+def _winning_chance(score: chess.engine.PovScore) -> float:
+    """Convert a PovScore to a winning probability in [0, 1] for the side to move."""
+    cp = score.relative.score(mate_score=10000)
+    return 1.0 / (1.0 + math.exp(-cp / 400.0))
 
 
-def compute_rewards(
-    fens: list[str],
+def _check_uniqueness(
+    board: chess.Board,
     engine: chess.engine.SimpleEngine,
-    board_position_set: set[str],
-    weights: tuple[float, float, float] = (0.4, 0.3, 0.3),
-) -> torch.Tensor:
-    """Combine realism, uniqueness, and diversity into a single weighted reward tensor."""
-    w_realism, w_uniqueness, w_diversity = weights
-    r = realism_reward(fens, engine)
-    u = uniqueness_reward(fens, board_position_set)
-    d = diversity_reward(fens)
-    return w_realism * r + w_uniqueness * u + w_diversity * d
+    depth: int,
+    tau_uni: float,
+) -> tuple[bool, str, float]:
+    """Return (passes_uniqueness, pv_string, uniqueness_score).
+
+    Uniqueness holds when the best move's winning chance exceeds the second best
+    by at least tau_uni. The score is w1-w2 in [0, 1].
+    """
+    try:
+        infos = engine.analyse(board, chess.engine.Limit(depth=depth), multipv=2)
+    except Exception as e:
+        print(f"WARNING: Stockfish analysis failed ({type(e).__name__}: {e})", flush=True)
+        return False, "", 0.0
+    if not infos:
+        return False, "", 0.0
+    pv = " ".join(move.uci() for move in infos[0].get("pv", []))
+    if len(infos) < 2:
+        return True, pv, 1.0
+    w1 = _winning_chance(infos[0]["score"])
+    w2 = _winning_chance(infos[1]["score"])
+    diff = w1 - w2
+    return diff >= tau_uni, pv, diff
+
+
+def _shallow_top_move(
+    board: chess.Board,
+    engine: chess.engine.SimpleEngine,
+    depth: int,
+) -> str:
+    """Return the UCI string of the top move at the given shallow depth, or empty string on failure."""
+    try:
+        infos = engine.analyse(board, chess.engine.Limit(depth=depth), multipv=1)
+        if infos and infos[0].get("pv"):
+            return infos[0]["pv"][0].uci()
+    except Exception as e:
+        print(f"WARNING: Shallow Stockfish analysis failed ({type(e).__name__}: {e})", flush=True)
+    return ""
+
+
+def compute_binary_rewards(
+    fens: list[str],
+    sequences: torch.Tensor,
+    engine: chess.engine.SimpleEngine,
+    replay_buffer: ReplayBuffer,
+    model: torch.nn.Module,
+    tau_board: int = 5,
+    tau_pv: int = 3,
+    tau_ent: float = 0.5,
+    tau_uni: float = 0.3,
+    tactical_depth: int = 10,
+    shallow_depth: int = 4,
+) -> tuple[torch.Tensor, list[tuple[str, str]], list[float], list[bool]]:
+    """Return rewards, qualifying positions, uniqueness scores, and counter-intuitive flags.
+
+    Rewards: -2 (illegal), 0 (valid but fails), +1 (qualifying), +2 (qualifying + counter-intuitive).
+    """
+    scores: list[float] = []
+    qualifying: list[tuple[str, str]] = []
+    uniqueness_scores: list[float] = []
+    counter_flags: list[bool] = []
+
+    with torch.no_grad():
+        entropies: list[float] = model.compute_entropy(sequences).tolist()
+
+    for i, fen in enumerate(fens):
+        if not is_valid_fen(fen):
+            scores.append(-2.0)
+            continue
+
+        if not is_realistic_piece_count(fen):
+            scores.append(0.0)
+            continue
+
+        board = chess.Board(fen)
+        if not board.is_valid() or board.is_game_over():
+            scores.append(0.0)
+            continue
+
+        if entropies[i] < tau_ent:
+            scores.append(0.0)
+            continue
+
+        unique, pv, uni_score = _check_uniqueness(board, engine, tactical_depth, tau_uni)
+        if not unique:
+            scores.append(0.0)
+            continue
+
+        board_str = extract_board_position(fen)
+        if not replay_buffer.is_novel(board_str, pv, tau_board, tau_pv):
+            scores.append(0.0)
+            continue
+
+        deep_top = pv.split()[0] if pv else ""
+        shallow_top = _shallow_top_move(board, engine, shallow_depth)
+        is_counter_intuitive = bool(deep_top and shallow_top and deep_top != shallow_top)
+
+        scores.append(2.0 if is_counter_intuitive else 1.0)
+        qualifying.append((board_str, pv))
+        uniqueness_scores.append(uni_score)
+        counter_flags.append(is_counter_intuitive)
+
+    return torch.tensor(scores, dtype=torch.float32), qualifying, uniqueness_scores, counter_flags

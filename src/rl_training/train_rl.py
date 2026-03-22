@@ -14,22 +14,27 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from data import ChessDataset
 from model import AutoRegressiveTransformer
 from tokenizer import FENTokenizer
-from rewards import compute_rewards, realism_reward, uniqueness_reward, diversity_reward
+from rewards import compute_binary_rewards, extract_board_position
+from replay_buffer import ReplayBuffer
 
 BATCH_SIZE = 32
 LR = 1e-6
+PPO_EPOCHS = 4
+PPO_EPS = 0.2
+KL_COEFF = 0.1
+SL_COEFF = 0.1
 NUM_STEPS = 1000
 LOG_INTERVAL = 10
 CHECKPOINT_INTERVAL = 100
+DATA_MIX_SIZE = 100_000
+REPLAY_BUFFER_SIZE = 10_000
+TAU_BOARD = 5
+TAU_PV = 3
+TAU_ENT = 1.0
+TACTICAL_DEPTH = 10
 PRETRAINED_CHECKPOINT_PATH = "outputs/model_checkpoint_1000_iterations_128_bs.pt"
 RL_CHECKPOINT_DIR = "outputs/rl_checkpoints"
 DATA_PATH = "data/encoded_fens.npy"
-
-
-def extract_board_position(fen: str) -> str:
-    """Extract the first 4 FEN fields as a canonical board position string."""
-    parts = fen.split(" ")
-    return " ".join(parts[:4])
 
 
 def build_board_position_hash_set(dataset: ChessDataset, tokenizer: FENTokenizer) -> set[str]:
@@ -40,15 +45,6 @@ def build_board_position_hash_set(dataset: ChessDataset, tokenizer: FENTokenizer
         board_positions.add(extract_board_position(fen_str))
     print(f"Built hash set with {len(board_positions)} unique positions")
     return board_positions
-
-
-def is_valid_fen(fen: str) -> bool:
-    """Return True if the FEN string represents a legal chess position."""
-    try:
-        chess.Board(fen)
-        return True
-    except Exception:
-        return False
 
 
 def decode_sequences(sequences: torch.Tensor, tokenizer: FENTokenizer) -> list[str]:
@@ -62,8 +58,14 @@ def decode_sequences(sequences: torch.Tensor, tokenizer: FENTokenizer) -> list[s
     return fens
 
 
+def sample_sl_batch(dataset: ChessDataset, sl_indices: list[int], batch_size: int, device: torch.device) -> torch.Tensor:
+    """Sample a random batch from the pre-selected SL indices."""
+    chosen = torch.randint(len(sl_indices), (batch_size,))
+    return torch.stack([dataset[sl_indices[i.item()]] for i in chosen]).to(device)
+
+
 def main() -> None:
-    """Run REINFORCE RL training loop to improve chess puzzle generation quality."""
+    """Run PPO RL training loop to improve chess puzzle generation quality."""
     if torch.cuda.is_available():
         device = torch.device("cuda")
     elif torch.mps.is_available():
@@ -76,6 +78,11 @@ def main() -> None:
     dataset = ChessDataset(DATA_PATH)
     board_position_set = build_board_position_hash_set(dataset, tokenizer)
 
+    sl_indices = torch.randperm(len(dataset))[:DATA_MIX_SIZE].tolist()
+    print(f"Pre-sampled {len(sl_indices)} SL indices for data mixture")
+
+    replay_buffer = ReplayBuffer(REPLAY_BUFFER_SIZE)
+
     model = AutoRegressiveTransformer().to(device)
     if os.path.exists(PRETRAINED_CHECKPOINT_PATH):
         state_dict = torch.load(PRETRAINED_CHECKPOINT_PATH, map_location=device)
@@ -83,6 +90,12 @@ def main() -> None:
         print(f"Loaded pretrained checkpoint from {PRETRAINED_CHECKPOINT_PATH}")
     else:
         print(f"Warning: no checkpoint found at {PRETRAINED_CHECKPOINT_PATH}, starting from scratch")
+
+    ref_model = AutoRegressiveTransformer().to(device)
+    ref_model.load_state_dict(model.state_dict())
+    ref_model.eval()
+    for p in ref_model.parameters():
+        p.requires_grad_(False)
 
     os.makedirs(RL_CHECKPOINT_DIR, exist_ok=True)
     backup_path = os.path.join(RL_CHECKPOINT_DIR, "pretrained_backup.pt")
@@ -92,55 +105,103 @@ def main() -> None:
     stockfish_path = shutil.which("stockfish") or "/usr/games/stockfish"
     engine = chess.engine.SimpleEngine.popen_uci(stockfish_path)
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
-    metrics: dict[str, list] = {"rewards": [], "loss": [], "validity": [], "realism": [], "uniqueness": [], "diversity": []}
+    metrics: dict[str, list] = {
+        "rewards": [],
+        "loss": [],
+        "ppo_loss": [],
+        "kl_penalty": [],
+        "sl_loss": [],
+        "validity": [],
+        "tactical_rate": [],
+        "replay_buffer_size": [],
+    }
 
     try:
         for step in range(NUM_STEPS):
             start_idx = torch.zeros((BATCH_SIZE, 1), dtype=torch.long, device=device)
 
+            model.eval()
             with torch.no_grad():
                 sequences = model.generate(start_idx, max_new_tokens=83)
+                model.eval()  # generate() calls self.train() internally; re-enter eval
+                old_seq_log_probs = model.compute_sequence_log_prob(sequences)
 
             fens = decode_sequences(sequences, tokenizer)
-            r_realism = realism_reward(fens, engine)
-            r_uniqueness = uniqueness_reward(fens, board_position_set)
-            r_diversity = diversity_reward(fens)
-            rewards = (0.4 * r_realism + 0.3 * r_uniqueness + 0.3 * r_diversity).to(device)
+            rewards, qualifying = compute_binary_rewards(
+                fens, sequences, engine, board_position_set, replay_buffer, model,
+                tau_board=TAU_BOARD, tau_pv=TAU_PV, tau_ent=TAU_ENT,
+                tactical_depth=TACTICAL_DEPTH,
+            )
+            for board_str, pv in qualifying:
+                replay_buffer.add(board_str, pv)
 
-            model.train()
-            log_probs = model.compute_log_probs(sequences)
-            seq_log_probs = log_probs.sum(dim=1)
-
+            rewards = rewards.to(device)
             advantages = rewards - rewards.mean()
-            loss = -(seq_log_probs * advantages).mean()
 
-            loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0).item()
-            optimizer.step()
-            optimizer.zero_grad()
+            sl_batch = sample_sl_batch(dataset, sl_indices, BATCH_SIZE, device)
+
+            last_ppo_loss = torch.tensor(0.0)
+            last_kl = torch.tensor(0.0)
+            last_sl_loss = torch.tensor(0.0)
+            last_loss = torch.tensor(0.0)
+
+            for _ in range(PPO_EPOCHS):
+                model.eval()
+
+                new_log_probs = model.compute_log_probs(sequences)
+                new_seq_log_probs = new_log_probs.sum(dim=1)
+                ratio = torch.exp(new_seq_log_probs - old_seq_log_probs.detach())
+                surr1 = ratio * advantages
+                surr2 = torch.clamp(ratio, 1 - PPO_EPS, 1 + PPO_EPS) * advantages
+                ppo_loss = -torch.min(surr1, surr2).mean()
+
+                with torch.no_grad():
+                    ref_log_probs = ref_model.compute_log_probs(sequences)
+                kl_penalty = (new_log_probs - ref_log_probs).mean()
+
+                model.train()
+                x_sl, y_sl = sl_batch[:, :-1], sl_batch[:, 1:]
+                _, sl_loss = model(x_sl, y_sl)
+
+                loss = ppo_loss + KL_COEFF * kl_penalty + SL_COEFF * sl_loss
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                optimizer.zero_grad()
+
+                last_ppo_loss = ppo_loss.detach()
+                last_kl = kl_penalty.detach()
+                last_sl_loss = sl_loss.detach()
+                last_loss = loss.detach()
 
             if step % LOG_INTERVAL == 0:
                 mean_reward = rewards.mean().item()
                 reward_std = rewards.std().item()
-                loss_val = loss.item()
-                validity = sum(1 for f in fens if is_valid_fen(f)) / BATCH_SIZE
-                mean_realism = r_realism.mean().item()
-                mean_uniqueness = r_uniqueness.mean().item()
-                mean_diversity = r_diversity.mean().item()
-                sample_fen = next((f for f in fens if is_valid_fen(f)), fens[0] if fens else "")
+                n_illegal = (rewards == -2).sum().item()
+                n_zero = (rewards == 0).sum().item()
+                n_pos = (rewards == 1).sum().item()
+                tactical_rate = n_pos / BATCH_SIZE
+                validity = (rewards > -2).sum().item() / BATCH_SIZE
 
                 metrics["rewards"].append((step, mean_reward))
-                metrics["loss"].append((step, loss_val))
+                metrics["loss"].append((step, last_loss.item()))
+                metrics["ppo_loss"].append((step, last_ppo_loss.item()))
+                metrics["kl_penalty"].append((step, last_kl.item()))
+                metrics["sl_loss"].append((step, last_sl_loss.item()))
                 metrics["validity"].append((step, validity))
-                metrics["realism"].append((step, mean_realism))
-                metrics["uniqueness"].append((step, mean_uniqueness))
-                metrics["diversity"].append((step, mean_diversity))
+                metrics["tactical_rate"].append((step, tactical_rate))
+                metrics["replay_buffer_size"].append((step, len(replay_buffer)))
+
+                qualifying_fens = [fens[i] for i in range(BATCH_SIZE) if rewards[i].item() == 1.0]
+                sample_fens = qualifying_fens[:3] or [f for f in fens if f][:3]
+                samples_str = "\n".join(f"             {f}" for f in sample_fens)
 
                 print(
-                    f"Step {step:4d} | Loss: {loss_val:.4f} | Reward: {mean_reward:.4f} ± {reward_std:.4f} | "
-                    f"Validity: {validity:.2%} | GradNorm: {grad_norm:.4f}\n"
-                    f"           Realism: {mean_realism:.4f} | Uniqueness: {mean_uniqueness:.4f} | Diversity: {mean_diversity:.4f}\n"
-                    f"           Sample: {sample_fen}"
+                    f"Step {step:4d} | Loss: {last_loss.item():.4f} | Reward: {mean_reward:.4f} ± {reward_std:.4f}\n"
+                    f"           PPO: {last_ppo_loss.item():.4f} | KL: {last_kl.item():.4f} | SL: {last_sl_loss.item():.4f}\n"
+                    f"           Rewards [-2/0/+1]: {n_illegal}/{n_zero}/{n_pos} | "
+                    f"TacticalRate: {tactical_rate:.2%} | ReplayBuf: {len(replay_buffer)}\n"
+                    f"           Samples ({'qualifying' if qualifying_fens else 'any valid'}):\n{samples_str}"
                 )
 
             if (step + 1) % CHECKPOINT_INTERVAL == 0:
