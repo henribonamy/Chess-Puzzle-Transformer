@@ -19,13 +19,13 @@ HF_DATA_REPO = "henribonamy/chess-puzzles-data"
 PRETRAINED_CHECKPOINT_PATH = "outputs/model_checkpoint.pt"
 FINETUNED_CHECKPOINT_PATH = "outputs/model_checkpoint_finetuned.pt"
 DATA_PATH = "data/encoded_fens.npy"
-HIGH_RATED_INDICES_PATH = "data/high_rated_indices.npy"
+INDICES_PATH = "data/counter_intuitive_indices.npy"
 
 BATCH_SIZE = 128
 LR = 1e-6
-EPOCHS = 1
-LOG_INTERVAL = 100
-CHECKPOINT_INTERVAL = 5000
+EPOCHS = 10
+LOG_INTERVAL = 20
+CHECKPOINT_INTERVAL = 300
 
 log_lines: list[str] = []
 
@@ -99,22 +99,22 @@ def push_checkpoint(local_path: str) -> None:
 
 
 def main() -> None:
-    """Fine-tune pretrained model on high-rated puzzle positions."""
+    """Fine-tune pretrained model on counter-intuitive puzzle positions."""
     start_log_server()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log(f"Using device: {device}")
 
     ensure_file(DATA_PATH, HF_DATA_REPO, "encoded_fens.npy", "dataset")
-    ensure_file(HIGH_RATED_INDICES_PATH, HF_DATA_REPO, "high_rated_indices.npy", "dataset")
+    ensure_file(INDICES_PATH, HF_DATA_REPO, "counter_intuitive_indices.npy", "dataset")
     ensure_file(PRETRAINED_CHECKPOINT_PATH, HF_PRETRAINED_REPO, "model_checkpoint.pt", "model")
 
     log("Loading data...")
     all_fens = np.load(DATA_PATH)
-    high_rated_indices = np.load(HIGH_RATED_INDICES_PATH)
-    log(f"Total encoded FENs: {len(all_fens):,} | High-rated indices: {len(high_rated_indices):,}")
+    indices = np.load(INDICES_PATH)
+    log(f"Total encoded FENs: {len(all_fens):,} | Counter-intuitive indices: {len(indices):,}")
 
-    dataset = SubsetDataset(all_fens, high_rated_indices)
+    dataset = SubsetDataset(all_fens, indices)
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0, pin_memory=True)
     log(f"Dataset size: {len(dataset):,} | Batches per epoch: {len(dataloader):,}")
 

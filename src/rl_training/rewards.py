@@ -86,10 +86,11 @@ def _analyse_position(
 ) -> tuple[bool, bool, str, float, float, float, float]:
     """Return (unique, counter_intuitive, pv_string, gap, r_cnt, w_deep, w_shallow).
 
-    Uniqueness (paper Eq. 1): gap >= tau_uni at tactical_depth.
-    Counter-intuitiveness: depth-1 best move must differ from depth-tactical best move
-    (the position requires deep calculation, not an obvious reply) AND r_cnt >= tau_cnt.
-    w_shallow measures how balanced the position looks at depth-1 (closer to 0.5 = more balanced).
+    Uniqueness: gap = w_deep - w2_deep >= tau_uni (best move clearly better than second-best).
+    Evaluation reversal: best move crosses a qualitative threshold vs all other moves:
+      Case A (find a win):  w_deep > 0.65 AND w2_deep < 0.65
+      Case B (save a draw): w_deep > 0.35 AND w2_deep < 0.35
+    Counter-intuitive puzzle: evaluation_reversal AND depth-1 best move != depth-N best move.
     """
     try:
         infos = engine.analyse(board, chess.engine.Limit(depth=tactical_depth), multipv=2)
@@ -105,7 +106,10 @@ def _analyse_position(
     gap = w_deep - w2_deep
     if gap < tau_uni:
         return False, False, pv, gap, 0.0, w_deep, w_deep
-    if w_deep < 0.5:
+    wins_when_others_draw  = w_deep > 0.65 and w2_deep < 0.65
+    draws_when_others_lose = w_deep > 0.35 and w2_deep < 0.35
+    evaluation_reversal = wins_when_others_draw or draws_when_others_lose
+    if not evaluation_reversal:
         return True, False, pv, gap, 0.0, w_deep, w_deep
     if board.is_capture(best_move):
         captured = board.piece_at(best_move.to_square)
@@ -129,11 +133,9 @@ def _analyse_position(
     if shallow_mate is not None and shallow_mate > 0:
         return True, False, pv, gap, 0.0, w_deep, w_deep
     w_shallow = _winning_chance(info_shallow[0]["score"])
-    r_cnt = w_deep - w_shallow
     move_disagree = best_move != best_move_shallow
-    r_cnt_effective = r_cnt + (0.1 if move_disagree else 0.0)
-    counter_intuitive = r_cnt_effective >= 0.0
-    return True, counter_intuitive, pv, gap, r_cnt_effective, w_deep, w_shallow
+    counter_intuitive = move_disagree
+    return True, counter_intuitive, pv, gap, w_deep - w_shallow, w_deep, w_shallow
 
 
 def compute_binary_rewards(
@@ -161,6 +163,7 @@ def compute_binary_rewards(
     n_valid = n_unique = n_counter = n_novel = 0
     n_unique_winning = 0
     n_balanced = 0
+    n_true_puzzles = 0
     r_cnt_unique_sum = 0.0
     gap_novel_sum = 0.0
 
@@ -205,12 +208,14 @@ def compute_binary_rewards(
             continue
 
         n_novel += 1
-        # Option A: reward gap directly (uniqueness signal, always non-zero for unique positions)
-        gap_reward = min(0.7, gap * 4.0)
-        # Option B: bonus for balanced positions (w_shallow < 0.55 = depth-1 doesn't see a clear winner)
+        if counter_intuitive:
+            # True puzzle: evaluation reversal + non-obvious move — full reward
+            n_true_puzzles += 1
+            reward = 1.0
+        else:
+            # Partial signal: unique position with gap, keeps gradient alive
+            reward = min(0.5, gap * 3.0)
         balanced = w_shallow < 0.55
-        balance_bonus = 0.3 if balanced else 0.0
-        reward = min(1.0, gap_reward + balance_bonus)
         if balanced:
             n_balanced += 1
         scores.append(reward)
@@ -224,5 +229,6 @@ def compute_binary_rewards(
         "n_valid": n_valid, "n_unique": n_unique, "n_counter": n_counter, "n_novel": n_novel,
         "n_unique_winning": n_unique_winning, "mean_r_cnt_unique": mean_r_cnt_unique,
         "n_balanced": n_balanced, "mean_gap_novel": mean_gap_novel,
+        "n_true_puzzles": n_true_puzzles,
     }
     return torch.tensor(scores, dtype=torch.float32), qualifying, r_cnt_scores, debug_counts

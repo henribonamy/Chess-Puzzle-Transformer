@@ -356,6 +356,7 @@ def main() -> None:
                     "n_unique_winning": debug_counts["n_unique_winning"],
                     "mean_gap": debug_counts["mean_gap_novel"],
                     "n_balanced": debug_counts["n_balanced"],
+                    "n_true_puzzles": debug_counts["n_true_puzzles"],
                     "replay_buffer_size": len(replay_buffer),
                     "step": step,
                 })
@@ -367,9 +368,9 @@ def main() -> None:
                     f"           Rewards [-2/0/+1]: {n_illegal}/{n_zero}/{n_pos} | "
                     f"Puzzles: {puzzle_rate:.1%} | Valid: {validity:.1%} | "
                     f"Filters [valid/unique/counter/novel]: {debug_counts['n_valid']}/{debug_counts['n_unique']}/{debug_counts['n_counter']}/{debug_counts['n_novel']} | "
-                    f"UniqueWin: {debug_counts['n_unique_winning']} | r_cnt_uniq: {debug_counts['mean_r_cnt_unique']:.4f} | "
-                    f"r_cnt: {mean_r_cnt:.4f} | gap: {debug_counts['mean_gap_novel']:.4f} | "
-                    f"balanced: {debug_counts['n_balanced']} | tau_cnt: {tau_cnt_current:.3f} | ReplayBuf: {len(replay_buffer)}"
+                    f"UniqueWin: {debug_counts['n_unique_winning']} | TruePuzzles: {debug_counts['n_true_puzzles']} | "
+                    f"gap: {debug_counts['mean_gap_novel']:.4f} | balanced: {debug_counts['n_balanced']} | "
+                    f"r_cnt: {mean_r_cnt:.4f} | ReplayBuf: {len(replay_buffer)}"
                     f"{examples_str}"
                 )
 
