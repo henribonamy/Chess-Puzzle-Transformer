@@ -30,12 +30,14 @@ HF_DATA_REPO = "henribonamy/chess-puzzles-data"
 HF_TRACKIO_SPACE = "henribonamy/chess-puzzles-trackio"
 TRACKIO_PROJECT = "chess-puzzles-rl"
 
-BATCH_SIZE = 32
+BATCH_SIZE = 64
 LR = 1e-6
 PPO_EPOCHS = 4
 PPO_EPS = 0.2
-KL_COEFF = 0.1
+KL_COEFF = 0.3
 SL_COEFF = 0.1
+SL_COEFF_WARMUP = 1.0
+SL_WARMUP_STEPS = 200
 NUM_STEPS = 1000
 LOG_INTERVAL = 10
 CHECKPOINT_INTERVAL = 100
@@ -44,29 +46,29 @@ REPLAY_BUFFER_SIZE = 10_000
 BUFFER_SEED_SIZE = 10_000
 TAU_BOARD = 5
 TAU_PV = 3
-TAU_ENT = 0.0
+TAU_ENT = 0.6
 TAU_UNI = 0.1
+TAU_CNT = -0.1
 TACTICAL_DEPTH = 6
-SHALLOW_DEPTH = 1
 PRETRAINED_CHECKPOINT_PATH = "outputs/model_checkpoint_1000_iterations_128_bs.pt"
 RL_CHECKPOINT_DIR = "outputs/rl_checkpoints"
 DATA_PATH = "data/encoded_fens.npy"
-COUNTER_INTUITIVE_INDICES_PATH = "data/counter_intuitive_indices.npy"
+HIGH_RATED_INDICES_PATH = "data/high_rated_indices.npy"
 
 
-def ensure_counter_intuitive_indices() -> None:
-    """Download counter-intuitive indices from HF Hub if not present locally."""
-    if os.path.exists(COUNTER_INTUITIVE_INDICES_PATH):
+def ensure_high_rated_indices() -> None:
+    """Download high-rated puzzle indices from HF Hub if not present locally."""
+    if os.path.exists(HIGH_RATED_INDICES_PATH):
         return
     os.makedirs("data", exist_ok=True)
-    print(f"Downloading counter_intuitive_indices.npy from {HF_DATA_REPO}...")
+    print(f"Downloading high_rated_indices.npy from {HF_DATA_REPO}...")
     hf_hub_download(
         repo_id=HF_DATA_REPO,
-        filename="counter_intuitive_indices.npy",
+        filename="high_rated_indices.npy",
         repo_type="dataset",
         local_dir="data",
     )
-    print("Counter-intuitive indices downloaded.")
+    print("High-rated indices downloaded.")
 
 
 def ensure_data() -> None:
@@ -102,10 +104,10 @@ def ensure_pretrained_checkpoint() -> None:
     os.makedirs("outputs", exist_ok=True)
     hf_hub_download(
         repo_id=HF_PRETRAINED_REPO,
-        filename="model_checkpoint.pt",
+        filename="model_checkpoint_finetuned.pt",
         local_dir="outputs",
     )
-    os.rename("outputs/model_checkpoint.pt", PRETRAINED_CHECKPOINT_PATH)
+    os.rename("outputs/model_checkpoint_finetuned.pt", PRETRAINED_CHECKPOINT_PATH)
 
 
 def push_checkpoint_to_hub(local_path: str, filename: str) -> None:
@@ -188,7 +190,7 @@ def main() -> None:
     """Run PPO RL training with trackio logging and HF Hub checkpoint pushing."""
     _start_health_server()
     ensure_data()
-    ensure_counter_intuitive_indices()
+    ensure_high_rated_indices()
     ensure_pretrained_checkpoint()
 
     trackio.init(TRACKIO_PROJECT, space_id=HF_TRACKIO_SPACE)
@@ -204,8 +206,8 @@ def main() -> None:
     tokenizer = FENTokenizer()
     dataset = ChessDataset(DATA_PATH)
 
-    sl_indices = np.load(COUNTER_INTUITIVE_INDICES_PATH).tolist()
-    _log(f"Loaded {len(sl_indices)} counter-intuitive SL indices from {COUNTER_INTUITIVE_INDICES_PATH}")
+    sl_indices = np.load(HIGH_RATED_INDICES_PATH).tolist()
+    _log(f"Loaded {len(sl_indices)} high-rated SL indices from {HIGH_RATED_INDICES_PATH}")
 
     replay_buffer = ReplayBuffer(REPLAY_BUFFER_SIZE)
     seed_replay_buffer(replay_buffer, dataset, tokenizer, BUFFER_SEED_SIZE)
@@ -221,6 +223,11 @@ def main() -> None:
     for p in ref_model.parameters():
         p.requires_grad_(False)
 
+    use_amp = device.type == "cuda"
+    autocast_ctx = lambda: torch.autocast("cuda", dtype=torch.float16) if use_amp else torch.autocast("cpu", enabled=False)
+    if use_amp:
+        _log("fp16 autocast enabled")
+
     os.makedirs(RL_CHECKPOINT_DIR, exist_ok=True)
     backup_path = os.path.join(RL_CHECKPOINT_DIR, "pretrained_backup.pt")
     torch.save(model.state_dict(), backup_path)
@@ -232,6 +239,7 @@ def main() -> None:
         or "/opt/homebrew/bin/stockfish"
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
+    scaler = torch.cuda.amp.GradScaler() if use_amp else None
     step_start_time = time.time()
 
     try:
@@ -239,17 +247,18 @@ def main() -> None:
             start_idx = torch.zeros((BATCH_SIZE, 1), dtype=torch.long, device=device)
 
             # generate_with_log_probs runs in eval mode and returns log probs at sampling time
-            with torch.no_grad():
+            with torch.no_grad(), autocast_ctx():
                 sequences, old_log_probs = model.generate_with_log_probs(start_idx, max_new_tokens=83)
 
             fens = decode_sequences(sequences, tokenizer)
             engine = chess.engine.SimpleEngine.popen_uci(stockfish_path)
             try:
-                rewards, qualifying, uniqueness_scores, counter_flags = compute_binary_rewards(
+                tau_cnt_current = min(TAU_CNT + step * 0.0015, 0.0)
+                rewards, qualifying, r_cnt_scores, debug_counts = compute_binary_rewards(
                     fens, sequences, engine, replay_buffer, model,
                     tau_board=TAU_BOARD, tau_pv=TAU_PV, tau_ent=TAU_ENT,
-                    tau_uni=TAU_UNI, tactical_depth=TACTICAL_DEPTH,
-                    shallow_depth=SHALLOW_DEPTH,
+                    tau_uni=TAU_UNI, tau_cnt=tau_cnt_current,
+                    tactical_depth=TACTICAL_DEPTH,
                 )
             finally:
                 try:
@@ -263,7 +272,7 @@ def main() -> None:
 
             # KL reward shaping (detached — shapes reward signal, not gradient)
             model.eval()
-            with torch.no_grad():
+            with torch.no_grad(), autocast_ctx():
                 ref_log_probs = ref_model.compute_log_probs(sequences)
                 policy_log_probs = model.compute_log_probs(sequences)
             token_kl = (policy_log_probs - ref_log_probs).mean(dim=-1)
@@ -281,21 +290,30 @@ def main() -> None:
             for _ in range(PPO_EPOCHS):
                 model.eval()  # match eval mode used by generate_with_log_probs
 
-                curr_log_probs = model.compute_log_probs(sequences)
-                log_ratio = (curr_log_probs - old_log_probs).mean(dim=-1)
-                ratio = torch.exp(log_ratio)
-                surr1 = ratio * advantages.detach()
-                surr2 = torch.clamp(ratio, 1 - PPO_EPS, 1 + PPO_EPS) * advantages.detach()
-                ppo_loss = -torch.min(surr1, surr2).mean()
+                with autocast_ctx():
+                    curr_log_probs = model.compute_log_probs(sequences)
+                    log_ratio = (curr_log_probs - old_log_probs).mean(dim=-1)
+                    ratio = torch.exp(log_ratio)
+                    surr1 = ratio * advantages.detach()
+                    surr2 = torch.clamp(ratio, 1 - PPO_EPS, 1 + PPO_EPS) * advantages.detach()
+                    ppo_loss = -torch.min(surr1, surr2).mean()
 
-                model.train()
-                x_sl, y_sl = sl_batch[:, :-1], sl_batch[:, 1:]
-                _, sl_loss = model(x_sl, y_sl)
+                    model.train()
+                    x_sl, y_sl = sl_batch[:, :-1], sl_batch[:, 1:]
+                    _, sl_loss = model(x_sl, y_sl)
 
-                loss = ppo_loss + SL_COEFF * sl_loss
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
+                    sl_coeff = SL_COEFF_WARMUP + (SL_COEFF - SL_COEFF_WARMUP) * min(step / SL_WARMUP_STEPS, 1.0)
+                    loss = ppo_loss + sl_coeff * sl_loss
+                if scaler is not None:
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step()
                 optimizer.zero_grad()
 
                 last_ppo_loss = ppo_loss.detach()
@@ -312,17 +330,15 @@ def main() -> None:
                 n_illegal = (rewards == -2).sum().item()
                 n_zero = (rewards == 0).sum().item()
                 n_pos = (rewards > 0).sum().item()
-                n_counter = (rewards == 2).sum().item()
-                tactical_rate = n_pos / BATCH_SIZE
-                counter_rate = n_counter / BATCH_SIZE
+                puzzle_rate = n_pos / BATCH_SIZE
                 validity = (rewards > -2).sum().item() / BATCH_SIZE
                 mean_kl = token_kl.mean().item()
 
-                counter_fens = [fens[i] for i in range(BATCH_SIZE) if rewards[i].item() == 2.0]
-                mean_uniqueness = sum(uniqueness_scores) / len(uniqueness_scores) if uniqueness_scores else 0.0
+                puzzle_fens = [fens[i] for i in range(BATCH_SIZE) if rewards[i].item() > 0.0]
+                mean_r_cnt = sum(r_cnt_scores) / len(r_cnt_scores) if r_cnt_scores else 0.0
                 examples_str = ""
-                if counter_fens:
-                    examples_str = "\n           Counter-intuitive puzzles:\n" + "\n".join(f"             {f}" for f in counter_fens[:3])
+                if puzzle_fens:
+                    examples_str = "\n           Puzzles:\n" + "\n".join(f"             {f}" for f in puzzle_fens[:3])
 
                 trackio.log({
                     "loss": last_loss.item(),
@@ -331,13 +347,15 @@ def main() -> None:
                     "sl_loss": last_sl_loss.item(),
                     "reward_mean": mean_reward,
                     "reward_std": reward_std,
-                    "puzzle_rate": tactical_rate * 100,
-                    "counter_intuitive_rate": counter_rate * 100,
+                    "puzzle_rate": puzzle_rate * 100,
                     "validity": validity * 100,
                     "n_qualifying": n_pos,
-                    "n_counter_intuitive": n_counter,
                     "n_illegal": n_illegal,
-                    "mean_uniqueness": mean_uniqueness,
+                    "mean_r_cnt": mean_r_cnt,
+                    "r_cnt_uniq": debug_counts["mean_r_cnt_unique"],
+                    "n_unique_winning": debug_counts["n_unique_winning"],
+                    "mean_gap": debug_counts["mean_gap_novel"],
+                    "n_balanced": debug_counts["n_balanced"],
                     "replay_buffer_size": len(replay_buffer),
                     "step": step,
                 })
@@ -345,10 +363,13 @@ def main() -> None:
                 _log(
                     f"Step {step:4d} | Loss: {last_loss.item():.4f} | Reward: {mean_reward:.4f} ± {reward_std:.4f} | "
                     f"{elapsed:.1f}s/10steps\n"
-                    f"           PPO: {last_ppo_loss.item():.4f} | KL: {mean_kl:.4f} | SL: {last_sl_loss.item():.4f}\n"
-                    f"           Rewards [-2/0/+1/+2]: {n_illegal}/{n_zero}/{n_pos - n_counter}/{n_counter} | "
-                    f"Puzzles: {tactical_rate:.1%} | Counter: {counter_rate:.1%} | Valid: {validity:.1%} | "
-                    f"Uni: {mean_uniqueness:.3f} | ReplayBuf: {len(replay_buffer)}"
+                    f"           PPO: {last_ppo_loss.item():.4f} | KL: {mean_kl:.4f} | SL: {last_sl_loss.item():.4f} (coeff={sl_coeff:.2f})\n"
+                    f"           Rewards [-2/0/+1]: {n_illegal}/{n_zero}/{n_pos} | "
+                    f"Puzzles: {puzzle_rate:.1%} | Valid: {validity:.1%} | "
+                    f"Filters [valid/unique/counter/novel]: {debug_counts['n_valid']}/{debug_counts['n_unique']}/{debug_counts['n_counter']}/{debug_counts['n_novel']} | "
+                    f"UniqueWin: {debug_counts['n_unique_winning']} | r_cnt_uniq: {debug_counts['mean_r_cnt_unique']:.4f} | "
+                    f"r_cnt: {mean_r_cnt:.4f} | gap: {debug_counts['mean_gap_novel']:.4f} | "
+                    f"balanced: {debug_counts['n_balanced']} | tau_cnt: {tau_cnt_current:.3f} | ReplayBuf: {len(replay_buffer)}"
                     f"{examples_str}"
                 )
 
