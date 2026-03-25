@@ -15,8 +15,8 @@ import trackio
 from huggingface_hub import HfApi, hf_hub_download
 from tqdm import tqdm
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src", "pretraining"))
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src", "rl_training"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "pretraining"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from data import ChessDataset
 from model import AutoRegressiveTransformer
@@ -35,8 +35,8 @@ ACCUM_STEPS = 4
 LR = 1e-6
 PPO_EPOCHS = 4
 PPO_EPS = 0.2
-KL_COEFF = 0.3
-SL_COEFF = 0.02
+KL_COEFF = 0.5
+SL_COEFF = 0.0
 ENTROPY_COEFF = 0.0
 NUM_STEPS = 1000
 LOG_INTERVAL = 10

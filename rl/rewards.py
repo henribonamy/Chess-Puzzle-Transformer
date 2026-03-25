@@ -206,7 +206,7 @@ def compute_binary_rewards(
             _analyse_position(board, engine, tactical_depth, tau_uni)
         )
         if not unique:
-            scores.append(0.0)
+            scores.append(gap * 0.3)
             continue
 
         n_unique += 1
@@ -219,11 +219,13 @@ def compute_binary_rewards(
         if multi_move:
             n_multi += 1
         board_str = extract_board_position(fen)
-        if not replay_buffer.is_novel(board_str, pv, tau_board, tau_pv):
-            scores.append(0.0)
-            continue
+        is_novel = replay_buffer.is_novel(board_str, pv, tau_board, tau_pv)
+        if is_novel:
+            n_novel += 1
+            qualifying.append((board_str, pv))
+            r_cnt_scores.append(gap)
+            gap_novel_sum += gap
 
-        n_novel += 1
         if multi_move:
             n_true_puzzles += 1
             reward = 1.0
@@ -232,17 +234,10 @@ def compute_binary_rewards(
         elif eval_reversal:
             reward = 0.0
         else:
-            if w_deep > 0.65:
-                proximity = max(0.0, 0.65 - w2_deep) / 0.65
-            elif w_deep > 0.35:
-                proximity = max(0.0, 0.35 - w2_deep) / 0.35
-            else:
-                proximity = 0.0
-            reward = proximity * 0.4
+            reward = gap * 0.5
+        if not is_novel:
+            reward *= 0.3
         scores.append(reward)
-        qualifying.append((board_str, pv))
-        r_cnt_scores.append(gap)
-        gap_novel_sum += gap
 
     mean_gap_novel = gap_novel_sum / n_novel if n_novel > 0 else 0.0
     debug_counts = {

@@ -6,8 +6,8 @@ import torch
 import chess
 import chess.engine
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src", "pretraining"))
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src", "rl_training"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "pretraining"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "rl"))
 
 from model import AutoRegressiveTransformer
 from tokenizer import FENTokenizer

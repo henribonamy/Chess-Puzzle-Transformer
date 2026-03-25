@@ -10,7 +10,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 from huggingface_hub import HfApi, hf_hub_download
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src", "pretraining"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "pretraining"))
 
 from model import AutoRegressiveTransformer
 from tokenizer import FENTokenizer

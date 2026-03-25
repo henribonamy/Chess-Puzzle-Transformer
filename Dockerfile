@@ -9,8 +9,7 @@ WORKDIR /app
 COPY requirements_space.txt .
 RUN pip install --no-cache-dir -r requirements_space.txt
 
-COPY train_hf.py .
-COPY finetune_hf.py .
-COPY src/ src/
+COPY pretraining/ pretraining/
+COPY rl/ rl/
 
-CMD ["python", "train_hf.py"]
+CMD ["python", "rl/train_hf.py"]
