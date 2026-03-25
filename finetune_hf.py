@@ -1,6 +1,7 @@
 import sys
 import os
 import time
+import json
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -22,10 +23,13 @@ DATA_PATH = "data/encoded_fens.npy"
 INDICES_PATH = "data/counter_intuitive_indices.npy"
 
 BATCH_SIZE = 128
-LR = 1e-6
-EPOCHS = 10
+LR = 1e-5
+EPOCHS = 50
+PLATEAU_PATIENCE = 3
+PLATEAU_MIN_DELTA = 0.001
 LOG_INTERVAL = 20
 CHECKPOINT_INTERVAL = 300
+METRICS_PATH = "outputs/finetune_metrics.json"
 
 log_lines: list[str] = []
 
@@ -87,15 +91,36 @@ def ensure_file(local_path: str, repo_id: str, filename: str, repo_type: str) ->
 
 def push_checkpoint(local_path: str) -> None:
     """Upload fine-tuned checkpoint to HF pretrained repo."""
-    api = HfApi()
-    api.create_repo(HF_PRETRAINED_REPO, repo_type="model", exist_ok=True)
-    api.upload_file(
-        path_or_fileobj=local_path,
-        path_in_repo="model_checkpoint_finetuned.pt",
-        repo_id=HF_PRETRAINED_REPO,
-        repo_type="model",
-    )
-    log(f"Pushed fine-tuned checkpoint to {HF_PRETRAINED_REPO}")
+    try:
+        api = HfApi()
+        api.create_repo(HF_PRETRAINED_REPO, repo_type="model", exist_ok=True)
+        api.upload_file(
+            path_or_fileobj=local_path,
+            path_in_repo="model_checkpoint_finetuned.pt",
+            repo_id=HF_PRETRAINED_REPO,
+            repo_type="model",
+        )
+        log(f"Pushed fine-tuned checkpoint to {HF_PRETRAINED_REPO}")
+    except Exception as e:
+        log(f"WARNING: Could not push checkpoint ({e})")
+
+
+def push_metrics(metrics: dict) -> None:
+    """Save metrics to disk and upload to HF pretrained repo."""
+    os.makedirs("outputs", exist_ok=True)
+    with open(METRICS_PATH, "w") as f:
+        json.dump(metrics, f)
+    try:
+        api = HfApi()
+        api.upload_file(
+            path_or_fileobj=METRICS_PATH,
+            path_in_repo="finetune_metrics.json",
+            repo_id=HF_PRETRAINED_REPO,
+            repo_type="model",
+        )
+        log("Pushed metrics to HF Hub")
+    except Exception as e:
+        log(f"WARNING: Could not push metrics ({e})")
 
 
 def main() -> None:
@@ -127,9 +152,17 @@ def main() -> None:
     scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
 
     total_steps = 0
+    metrics: dict = {"step_loss": [], "epoch_loss": []}
+    epoch_losses: list[float] = []
+    best_epoch_loss = float("inf")
+    epochs_without_improvement = 0
+
     for epoch in range(EPOCHS):
         model.train()
         running_loss = 0.0
+        running_steps = 0
+        epoch_loss_sum = 0.0
+        epoch_steps = 0
         t0 = time.time()
 
         for batch_idx, batch in enumerate(dataloader):
@@ -148,27 +181,48 @@ def main() -> None:
             optimizer.zero_grad()
 
             running_loss += loss.item()
+            running_steps += 1
+            epoch_loss_sum += loss.item()
+            epoch_steps += 1
             total_steps += 1
 
-            if total_steps % LOG_INTERVAL == 0:
+            if running_steps >= LOG_INTERVAL:
                 elapsed = time.time() - t0
-                avg_loss = running_loss / LOG_INTERVAL
+                avg_loss = running_loss / running_steps
                 pct = 100.0 * batch_idx / len(dataloader)
-                log(f"Epoch {epoch+1} | Step {total_steps} | {pct:.1f}% | Loss: {avg_loss:.4f} | {elapsed:.1f}s/{LOG_INTERVAL}steps")
+                log(f"Epoch {epoch+1} | Step {total_steps} | {pct:.1f}% | Loss: {avg_loss:.4f} | {elapsed:.1f}s/{running_steps}steps")
+                metrics["step_loss"].append([total_steps, avg_loss])
                 running_loss = 0.0
+                running_steps = 0
                 t0 = time.time()
 
             if total_steps % CHECKPOINT_INTERVAL == 0:
                 os.makedirs("outputs", exist_ok=True)
                 torch.save(model.state_dict(), FINETUNED_CHECKPOINT_PATH)
                 push_checkpoint(FINETUNED_CHECKPOINT_PATH)
+                push_metrics(metrics)
                 log(f"Checkpoint saved and pushed at step {total_steps}")
 
-        log(f"Epoch {epoch+1} complete.")
+        epoch_loss = epoch_loss_sum / epoch_steps if epoch_steps > 0 else 0.0
+        epoch_losses.append(epoch_loss)
+        metrics["epoch_loss"].append([epoch + 1, epoch_loss])
+        log(f"Epoch {epoch+1} complete. Avg loss: {epoch_loss:.4f}")
+        push_metrics(metrics)
+
+        if epoch_loss < best_epoch_loss - PLATEAU_MIN_DELTA:
+            best_epoch_loss = epoch_loss
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+            log(f"No improvement for {epochs_without_improvement}/{PLATEAU_PATIENCE} epochs (best: {best_epoch_loss:.4f})")
+            if epochs_without_improvement >= PLATEAU_PATIENCE:
+                log(f"Plateau detected. Stopping early at epoch {epoch+1}.")
+                break
 
     os.makedirs("outputs", exist_ok=True)
     torch.save(model.state_dict(), FINETUNED_CHECKPOINT_PATH)
     push_checkpoint(FINETUNED_CHECKPOINT_PATH)
+    push_metrics(metrics)
     log("Fine-tuning complete.")
 
 

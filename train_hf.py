@@ -31,13 +31,13 @@ HF_TRACKIO_SPACE = "henribonamy/chess-puzzles-trackio"
 TRACKIO_PROJECT = "chess-puzzles-rl"
 
 BATCH_SIZE = 64
+ACCUM_STEPS = 4
 LR = 1e-6
 PPO_EPOCHS = 4
 PPO_EPS = 0.2
 KL_COEFF = 0.3
-SL_COEFF = 0.1
-SL_COEFF_WARMUP = 1.0
-SL_WARMUP_STEPS = 200
+SL_COEFF = 0.02
+ENTROPY_COEFF = 0.0
 NUM_STEPS = 1000
 LOG_INTERVAL = 10
 CHECKPOINT_INTERVAL = 100
@@ -47,9 +47,8 @@ BUFFER_SEED_SIZE = 10_000
 TAU_BOARD = 5
 TAU_PV = 3
 TAU_ENT = 0.6
-TAU_UNI = 0.1
-TAU_CNT = -0.1
-TACTICAL_DEPTH = 6
+TAU_UNI = 0.2
+TACTICAL_DEPTH = 8
 PRETRAINED_CHECKPOINT_PATH = "outputs/model_checkpoint_1000_iterations_128_bs.pt"
 RL_CHECKPOINT_DIR = "outputs/rl_checkpoints"
 DATA_PATH = "data/encoded_fens.npy"
@@ -244,107 +243,147 @@ def main() -> None:
 
     try:
         for step in range(NUM_STEPS):
-            start_idx = torch.zeros((BATCH_SIZE, 1), dtype=torch.long, device=device)
+            all_sequences: list[torch.Tensor] = []
+            all_old_log_probs: list[torch.Tensor] = []
+            all_rewards: list[torch.Tensor] = []
+            all_fens: list[str] = []
+            all_r_cnt: list[float] = []
+            all_qualifying: list[tuple[str, str]] = []
+            agg_debug: dict[str, float] = {}
 
-            # generate_with_log_probs runs in eval mode and returns log probs at sampling time
-            with torch.no_grad(), autocast_ctx():
-                sequences, old_log_probs = model.generate_with_log_probs(start_idx, max_new_tokens=83)
-
-            fens = decode_sequences(sequences, tokenizer)
-            engine = chess.engine.SimpleEngine.popen_uci(stockfish_path)
-            try:
-                tau_cnt_current = min(TAU_CNT + step * 0.0015, 0.0)
-                rewards, qualifying, r_cnt_scores, debug_counts = compute_binary_rewards(
-                    fens, sequences, engine, replay_buffer, model,
-                    tau_board=TAU_BOARD, tau_pv=TAU_PV, tau_ent=TAU_ENT,
-                    tau_uni=TAU_UNI, tau_cnt=tau_cnt_current,
-                    tactical_depth=TACTICAL_DEPTH,
-                )
-            finally:
+            for accum_idx in range(ACCUM_STEPS):
+                start_idx = torch.zeros((BATCH_SIZE, 1), dtype=torch.long, device=device)
+                with torch.no_grad(), autocast_ctx():
+                    seqs, old_lp = model.generate_with_log_probs(start_idx, max_new_tokens=83)
+                fens = decode_sequences(seqs, tokenizer)
+                engine = chess.engine.SimpleEngine.popen_uci(stockfish_path)
                 try:
-                    engine.quit()
-                except Exception as e:
-                    _log(f"WARNING: engine.quit() failed at step {step}: {e}")
-            for board_str, pv in qualifying:
-                replay_buffer.add(board_str, pv)
+                    rews, qualifying, r_cnt, dbg = compute_binary_rewards(
+                        fens, seqs, engine, replay_buffer, model,
+                        tau_board=TAU_BOARD, tau_pv=TAU_PV, tau_ent=TAU_ENT,
+                        tau_uni=TAU_UNI, tactical_depth=TACTICAL_DEPTH,
+                    )
+                finally:
+                    try:
+                        engine.quit()
+                    except Exception as e:
+                        _log(f"WARNING: engine.quit() failed at step {step}: {e}")
+                for board_str, pv in qualifying:
+                    replay_buffer.add(board_str, pv)
+                all_sequences.append(seqs)
+                all_old_log_probs.append(old_lp)
+                all_rewards.append(rews.to(device))
+                all_fens.extend(fens)
+                all_r_cnt.extend(r_cnt)
+                all_qualifying.extend(qualifying)
+                for k, v in dbg.items():
+                    agg_debug[k] = agg_debug.get(k, 0) + v
 
-            rewards = rewards.to(device)
+            effective_bs = BATCH_SIZE * ACCUM_STEPS
+            cat_sequences = torch.cat(all_sequences, dim=0)
+            cat_old_log_probs = torch.cat(all_old_log_probs, dim=0)
+            cat_rewards = torch.cat(all_rewards, dim=0)
 
-            # KL reward shaping (detached — shapes reward signal, not gradient)
             model.eval()
+            kl_chunks = []
             with torch.no_grad(), autocast_ctx():
-                ref_log_probs = ref_model.compute_log_probs(sequences)
-                policy_log_probs = model.compute_log_probs(sequences)
-            token_kl = (policy_log_probs - ref_log_probs).mean(dim=-1)
-            shaped_rewards = rewards - KL_COEFF * token_kl
-
-            # Within-batch advantage normalization
+                for c in range(0, effective_bs, BATCH_SIZE):
+                    chunk = cat_sequences[c:c + BATCH_SIZE]
+                    ref_c = ref_model.compute_log_probs(chunk)
+                    pol_c = model.compute_log_probs(chunk)
+                    kl_chunks.append((pol_c - ref_c).mean(dim=-1))
+            token_kl = torch.cat(kl_chunks, dim=0)
+            shaped_rewards = cat_rewards - KL_COEFF * token_kl
             advantages = (shaped_rewards - shaped_rewards.mean()) / (shaped_rewards.std() + 1e-8)
 
             sl_batch = sample_sl_batch(dataset, sl_indices, BATCH_SIZE, device)
 
             last_ppo_loss = torch.tensor(0.0)
             last_sl_loss = torch.tensor(0.0)
+            last_ent_bonus = torch.tensor(0.0)
             last_loss = torch.tensor(0.0)
 
             for _ in range(PPO_EPOCHS):
-                model.eval()  # match eval mode used by generate_with_log_probs
+                optimizer.zero_grad()
+                ppo_loss_accum = 0.0
 
+                for c in range(0, effective_bs, BATCH_SIZE):
+                    chunk_seq = cat_sequences[c:c + BATCH_SIZE]
+                    chunk_old_lp = cat_old_log_probs[c:c + BATCH_SIZE]
+                    chunk_adv = advantages[c:c + BATCH_SIZE].detach()
+
+                    model.eval()
+                    with autocast_ctx():
+                        curr_lp = model.compute_log_probs(chunk_seq)
+                        token_ratio = torch.exp(curr_lp - chunk_old_lp)
+                        adv_expanded = chunk_adv.unsqueeze(1)
+                        surr1 = token_ratio * adv_expanded
+                        surr2 = torch.clamp(token_ratio, 1 - PPO_EPS, 1 + PPO_EPS) * adv_expanded
+                        chunk_ppo = -torch.min(surr1, surr2).mean() / ACCUM_STEPS
+
+                    if scaler is not None:
+                        scaler.scale(chunk_ppo).backward()
+                    else:
+                        chunk_ppo.backward()
+                    ppo_loss_accum += chunk_ppo.detach().item()
+
+                model.eval()
                 with autocast_ctx():
-                    curr_log_probs = model.compute_log_probs(sequences)
-                    log_ratio = (curr_log_probs - old_log_probs).mean(dim=-1)
-                    ratio = torch.exp(log_ratio)
-                    surr1 = ratio * advantages.detach()
-                    surr2 = torch.clamp(ratio, 1 - PPO_EPS, 1 + PPO_EPS) * advantages.detach()
-                    ppo_loss = -torch.min(surr1, surr2).mean()
+                    ent_logits = model.get_logits(cat_sequences[:BATCH_SIZE, :-1])
+                    ent = -(torch.softmax(ent_logits, dim=-1) * torch.log_softmax(ent_logits, dim=-1)).sum(dim=-1)
+                    ent_bonus = ent.mean()
+                    ent_loss = -ENTROPY_COEFF * ent_bonus
 
-                    model.train()
+                model.train()
+                with autocast_ctx():
                     x_sl, y_sl = sl_batch[:, :-1], sl_batch[:, 1:]
                     _, sl_loss = model(x_sl, y_sl)
+                    aux_loss = ent_loss + SL_COEFF * sl_loss
 
-                    sl_coeff = SL_COEFF_WARMUP + (SL_COEFF - SL_COEFF_WARMUP) * min(step / SL_WARMUP_STEPS, 1.0)
-                    loss = ppo_loss + sl_coeff * sl_loss
                 if scaler is not None:
-                    scaler.scale(loss).backward()
+                    scaler.scale(aux_loss).backward()
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     scaler.step(optimizer)
                     scaler.update()
                 else:
-                    loss.backward()
+                    aux_loss.backward()
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     optimizer.step()
-                optimizer.zero_grad()
 
-                last_ppo_loss = ppo_loss.detach()
+                last_ppo_loss = torch.tensor(ppo_loss_accum)
                 last_sl_loss = sl_loss.detach()
-                last_loss = loss.detach()
+                last_ent_bonus = ent_bonus.detach()
+                last_loss = torch.tensor(ppo_loss_accum + SL_COEFF * sl_loss.item() - ENTROPY_COEFF * ent_bonus.item())
 
             if step % LOG_INTERVAL == 0:
                 now = time.time()
                 elapsed = now - step_start_time
                 step_start_time = now
 
-                mean_reward = rewards.mean().item()
-                reward_std = rewards.std().item()
-                n_illegal = (rewards == -2).sum().item()
-                n_zero = (rewards == 0).sum().item()
-                n_pos = (rewards > 0).sum().item()
-                puzzle_rate = n_pos / BATCH_SIZE
-                validity = (rewards > -2).sum().item() / BATCH_SIZE
+                mean_reward = cat_rewards.mean().item()
+                reward_std = cat_rewards.std().item()
+                n_illegal = (cat_rewards == -2).sum().item()
+                n_zero = (cat_rewards == 0).sum().item()
+                n_pos = (cat_rewards > 0).sum().item()
+                puzzle_rate = n_pos / effective_bs
+                validity = (cat_rewards > -2).sum().item() / effective_bs
                 mean_kl = token_kl.mean().item()
 
-                puzzle_fens = [fens[i] for i in range(BATCH_SIZE) if rewards[i].item() > 0.0]
-                mean_r_cnt = sum(r_cnt_scores) / len(r_cnt_scores) if r_cnt_scores else 0.0
+                true_puzzle_fens = [all_fens[i] for i in range(effective_bs) if cat_rewards[i].item() == 1.0]
+                mean_r_cnt = sum(all_r_cnt) / len(all_r_cnt) if all_r_cnt else 0.0
                 examples_str = ""
-                if puzzle_fens:
-                    examples_str = "\n           Puzzles:\n" + "\n".join(f"             {f}" for f in puzzle_fens[:3])
+                if true_puzzle_fens:
+                    examples_str += "\n           MULTI-MOVE PUZZLES:\n" + "\n".join(f"             {f}" for f in true_puzzle_fens[:3])
+
+                debug_counts = {k: (v / ACCUM_STEPS if k.startswith("mean") else v) for k, v in agg_debug.items()}
 
                 trackio.log({
                     "loss": last_loss.item(),
                     "ppo_loss": last_ppo_loss.item(),
                     "kl": mean_kl,
                     "sl_loss": last_sl_loss.item(),
+                    "entropy": last_ent_bonus.item(),
                     "reward_mean": mean_reward,
                     "reward_std": reward_std,
                     "puzzle_rate": puzzle_rate * 100,
@@ -352,11 +391,13 @@ def main() -> None:
                     "n_qualifying": n_pos,
                     "n_illegal": n_illegal,
                     "mean_r_cnt": mean_r_cnt,
-                    "r_cnt_uniq": debug_counts["mean_r_cnt_unique"],
-                    "n_unique_winning": debug_counts["n_unique_winning"],
-                    "mean_gap": debug_counts["mean_gap_novel"],
-                    "n_balanced": debug_counts["n_balanced"],
-                    "n_true_puzzles": debug_counts["n_true_puzzles"],
+                    "n_unique_winning": debug_counts.get("n_unique_winning", 0),
+                    "n_reversal": debug_counts.get("n_reversal", 0),
+                    "n_non_obvious": debug_counts.get("n_non_obvious", 0),
+                    "n_multi": debug_counts.get("n_multi", 0),
+                    "mean_gap": debug_counts.get("mean_gap_novel", 0),
+                    "n_balanced": debug_counts.get("n_balanced", 0),
+                    "n_true_puzzles": debug_counts.get("n_true_puzzles", 0),
                     "replay_buffer_size": len(replay_buffer),
                     "step": step,
                 })
@@ -364,13 +405,13 @@ def main() -> None:
                 _log(
                     f"Step {step:4d} | Loss: {last_loss.item():.4f} | Reward: {mean_reward:.4f} ± {reward_std:.4f} | "
                     f"{elapsed:.1f}s/10steps\n"
-                    f"           PPO: {last_ppo_loss.item():.4f} | KL: {mean_kl:.4f} | SL: {last_sl_loss.item():.4f} (coeff={sl_coeff:.2f})\n"
+                    f"           PPO: {last_ppo_loss.item():.4f} | KL: {mean_kl:.4f} | SL: {last_sl_loss.item():.4f} (coeff={SL_COEFF:.2f}) | Ent: {last_ent_bonus.item():.4f}\n"
                     f"           Rewards [-2/0/+1]: {n_illegal}/{n_zero}/{n_pos} | "
                     f"Puzzles: {puzzle_rate:.1%} | Valid: {validity:.1%} | "
-                    f"Filters [valid/unique/counter/novel]: {debug_counts['n_valid']}/{debug_counts['n_unique']}/{debug_counts['n_counter']}/{debug_counts['n_novel']} | "
-                    f"UniqueWin: {debug_counts['n_unique_winning']} | TruePuzzles: {debug_counts['n_true_puzzles']} | "
-                    f"gap: {debug_counts['mean_gap_novel']:.4f} | balanced: {debug_counts['n_balanced']} | "
-                    f"r_cnt: {mean_r_cnt:.4f} | ReplayBuf: {len(replay_buffer)}"
+                    f"Filters [valid/uniq/rev/nonobv/multi/novel]: {debug_counts.get('n_valid', 0)}/{debug_counts.get('n_unique', 0)}/{debug_counts.get('n_reversal', 0)}/{debug_counts.get('n_non_obvious', 0)}/{debug_counts.get('n_multi', 0)}/{debug_counts.get('n_novel', 0)} | "
+                    f"TruePuzzles: {debug_counts.get('n_true_puzzles', 0)} | "
+                    f"gap: {debug_counts.get('mean_gap_novel', 0):.4f} | balanced: {debug_counts.get('n_balanced', 0)} | "
+                    f"ReplayBuf: {len(replay_buffer)}"
                     f"{examples_str}"
                 )
 
