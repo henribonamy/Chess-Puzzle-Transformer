@@ -1,5 +1,11 @@
 import sys
 import os
+
+# Set writable cache/home dirs before any HF imports
+os.environ.setdefault("HF_HOME", "/tmp/hf_home")
+os.environ.setdefault("XDG_CACHE_HOME", "/tmp/cache")
+os.environ.setdefault("HOME", "/tmp")
+
 import json
 import shutil
 import subprocess
@@ -87,13 +93,7 @@ def ensure_data() -> None:
         )
         print("Data downloaded.")
     except Exception as e:
-        print(f"Download failed ({e}), running preprocessing instead...")
-        env = {**os.environ, "PYTHONPATH": os.path.join("src", "pretraining")}
-        subprocess.run(
-            [sys.executable, os.path.join("src", "pretraining", "preprocessing.py")],
-            env=env,
-            check=True,
-        )
+        raise RuntimeError(f"Failed to download encoded FENs from {HF_DATA_REPO}: {e}")
 
 
 def ensure_pretrained_checkpoint() -> None:
