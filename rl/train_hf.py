@@ -43,9 +43,9 @@ REPLAY_BUFFER_SIZE = 10_000
 BUFFER_SEED_SIZE = 10_000
 TAU_BOARD = 5
 TAU_PV = 3
-TAU_ENT = 0.6
+TAU_ENT = 0.3
 TAU_UNI = 0.2
-TACTICAL_DEPTH = 8
+TACTICAL_DEPTH = 6
 PRETRAINED_CHECKPOINT_PATH = "outputs/model_checkpoint_1000_iterations_128_bs.pt"
 RL_CHECKPOINT_DIR = "outputs/rl_checkpoints"
 DATA_PATH = "data/encoded_fens.npy"
@@ -246,33 +246,33 @@ def main() -> None:
             all_qualifying: list[tuple[str, str]] = []
             agg_debug: dict[str, float] = {}
 
-            for accum_idx in range(ACCUM_STEPS):
-                start_idx = torch.zeros((BATCH_SIZE, 1), dtype=torch.long, device=device)
-                with torch.no_grad(), autocast_ctx():
-                    seqs, old_lp = model.generate_with_log_probs(start_idx, max_new_tokens=83)
-                fens = decode_sequences(seqs, tokenizer)
-                engine = chess.engine.SimpleEngine.popen_uci(stockfish_path)
-                try:
+            engine = chess.engine.SimpleEngine.popen_uci(stockfish_path)
+            try:
+                for accum_idx in range(ACCUM_STEPS):
+                    start_idx = torch.zeros((BATCH_SIZE, 1), dtype=torch.long, device=device)
+                    with torch.no_grad(), autocast_ctx():
+                        seqs, old_lp = model.generate_with_log_probs(start_idx, max_new_tokens=83)
+                    fens = decode_sequences(seqs, tokenizer)
                     rews, qualifying, r_cnt, dbg = compute_binary_rewards(
                         fens, seqs, engine, replay_buffer, model,
                         tau_board=TAU_BOARD, tau_pv=TAU_PV, tau_ent=TAU_ENT,
                         tau_uni=TAU_UNI, tactical_depth=TACTICAL_DEPTH,
                     )
-                finally:
-                    try:
-                        engine.quit()
-                    except Exception as e:
-                        _log(f"WARNING: engine.quit() failed at step {step}: {e}")
-                for board_str, pv in qualifying:
-                    replay_buffer.add(board_str, pv)
-                all_sequences.append(seqs)
-                all_old_log_probs.append(old_lp)
-                all_rewards.append(rews.to(device))
-                all_fens.extend(fens)
-                all_r_cnt.extend(r_cnt)
-                all_qualifying.extend(qualifying)
-                for k, v in dbg.items():
-                    agg_debug[k] = agg_debug.get(k, 0) + v
+                    for board_str, pv in qualifying:
+                        replay_buffer.add(board_str, pv)
+                    all_sequences.append(seqs)
+                    all_old_log_probs.append(old_lp)
+                    all_rewards.append(rews.to(device))
+                    all_fens.extend(fens)
+                    all_r_cnt.extend(r_cnt)
+                    all_qualifying.extend(qualifying)
+                    for k, v in dbg.items():
+                        agg_debug[k] = agg_debug.get(k, 0) + v
+            finally:
+                try:
+                    engine.quit()
+                except Exception as e:
+                    _log(f"WARNING: engine.quit() failed at step {step}: {e}")
 
             effective_bs = BATCH_SIZE * ACCUM_STEPS
             cat_sequences = torch.cat(all_sequences, dim=0)
