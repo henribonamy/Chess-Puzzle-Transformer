@@ -48,23 +48,25 @@ TAU_ENT = 0.3
 TAU_UNI = 0.2
 TACTICAL_DEPTH = 6
 NUM_STOCKFISH_WORKERS = 4
-PRETRAINED_CHECKPOINT_PATH = "outputs/model_checkpoint_1000_iterations_128_bs.pt"
-RL_CHECKPOINT_DIR = "outputs/rl_checkpoints"
-DATA_PATH = "data/encoded_fens.npy"
-HIGH_RATED_INDICES_PATH = "data/high_rated_indices.npy"
+_BASE_DIR = "/tmp/chess_rl"
+PRETRAINED_CHECKPOINT_PATH = f"{_BASE_DIR}/outputs/model_checkpoint_1000_iterations_128_bs.pt"
+RL_CHECKPOINT_DIR = f"{_BASE_DIR}/outputs/rl_checkpoints"
+DATA_PATH = f"{_BASE_DIR}/data/encoded_fens.npy"
+HIGH_RATED_INDICES_PATH = f"{_BASE_DIR}/data/high_rated_indices.npy"
 
 
 def ensure_high_rated_indices() -> None:
     """Download high-rated puzzle indices from HF Hub if not present locally."""
     if os.path.exists(HIGH_RATED_INDICES_PATH):
         return
-    os.makedirs("data", exist_ok=True)
+    data_dir = os.path.dirname(HIGH_RATED_INDICES_PATH)
+    os.makedirs(data_dir, exist_ok=True)
     print(f"Downloading high_rated_indices.npy from {HF_DATA_REPO}...")
     hf_hub_download(
         repo_id=HF_DATA_REPO,
         filename="high_rated_indices.npy",
         repo_type="dataset",
-        local_dir="data",
+        local_dir=data_dir,
     )
     print("High-rated indices downloaded.")
 
@@ -73,16 +75,16 @@ def ensure_data() -> None:
     """Download encoded FENs from HF Hub, or run preprocessing as fallback."""
     if os.path.exists(DATA_PATH):
         return
-    os.makedirs("data", exist_ok=True)
+    data_dir = os.path.dirname(DATA_PATH)
+    os.makedirs(data_dir, exist_ok=True)
     try:
         print(f"Downloading encoded FENs from {HF_DATA_REPO}...")
         hf_hub_download(
             repo_id=HF_DATA_REPO,
             filename="encoded_fens.npy",
             repo_type="dataset",
-            local_dir="data",
+            local_dir=data_dir,
         )
-        os.rename("data/encoded_fens.npy", DATA_PATH) if not os.path.exists(DATA_PATH) else None
         print("Data downloaded.")
     except Exception as e:
         print(f"Download failed ({e}), running preprocessing instead...")
@@ -99,13 +101,16 @@ def ensure_pretrained_checkpoint() -> None:
     if os.path.exists(PRETRAINED_CHECKPOINT_PATH):
         return
     print(f"Checkpoint not found locally — downloading from {HF_PRETRAINED_REPO}...")
-    os.makedirs("outputs", exist_ok=True)
+    out_dir = os.path.dirname(PRETRAINED_CHECKPOINT_PATH)
+    os.makedirs(out_dir, exist_ok=True)
     hf_hub_download(
         repo_id=HF_PRETRAINED_REPO,
         filename="model_checkpoint_finetuned.pt",
-        local_dir="outputs",
+        local_dir=out_dir,
     )
-    os.rename("outputs/model_checkpoint_finetuned.pt", PRETRAINED_CHECKPOINT_PATH)
+    dl_path = os.path.join(out_dir, "model_checkpoint_finetuned.pt")
+    if dl_path != PRETRAINED_CHECKPOINT_PATH:
+        os.rename(dl_path, PRETRAINED_CHECKPOINT_PATH)
 
 
 def find_latest_rl_checkpoint() -> tuple[str | None, int]:
