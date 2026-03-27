@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import numpy as np
@@ -20,7 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from data import ChessDataset
 from model import AutoRegressiveTransformer
 from tokenizer import FENTokenizer
-from rewards import compute_binary_rewards, extract_board_position
+from rewards import compute_binary_rewards, extract_board_position, score_single_fen
 from replay_buffer import ReplayBuffer
 
 HF_PRETRAINED_REPO = "henribonamy/chess-puzzles-pretrained"
@@ -32,7 +33,7 @@ ACCUM_STEPS = 4
 LR = 1e-6
 PPO_EPOCHS = 4
 PPO_EPS = 0.2
-KL_COEFF = 0.5
+KL_COEFF = 0.1
 SL_COEFF = 0.05
 ENTROPY_COEFF = 0.01
 NUM_STEPS = 1000
@@ -46,6 +47,7 @@ TAU_PV = 3
 TAU_ENT = 0.3
 TAU_UNI = 0.2
 TACTICAL_DEPTH = 6
+NUM_STOCKFISH_WORKERS = 4
 PRETRAINED_CHECKPOINT_PATH = "outputs/model_checkpoint_1000_iterations_128_bs.pt"
 RL_CHECKPOINT_DIR = "outputs/rl_checkpoints"
 DATA_PATH = "data/encoded_fens.npy"
@@ -208,6 +210,53 @@ def _start_health_server() -> None:
     threading.Thread(target=HTTPServer(("0.0.0.0", 7860), _Handler).serve_forever, daemon=True).start()
 
 
+def _parallel_compute_rewards(
+    fens: list[str],
+    sequences: torch.Tensor,
+    engines: list[chess.engine.SimpleEngine],
+    engine_locks: list[threading.Lock],
+    replay_buffer: ReplayBuffer,
+    entropies: list[float],
+    tau_board: int = 5,
+    tau_pv: int = 3,
+    tau_ent: float = 0.3,
+    tau_uni: float = 0.2,
+    tactical_depth: int = 6,
+) -> tuple[torch.Tensor, list[tuple[str, str]], list[float], dict[str, int]]:
+    """Parallel version of compute_binary_rewards using multiple Stockfish engines."""
+    n_workers = len(engines)
+    results: list[tuple[float, bool, str, str, float, dict[str, int]]] = [None] * len(fens)  # type: ignore
+
+    def _process(idx: int) -> None:
+        worker_id = idx % n_workers
+        with engine_locks[worker_id]:
+            results[idx] = score_single_fen(
+                fens[idx], entropies[idx], engines[worker_id], replay_buffer,
+                tau_ent, tau_uni, tactical_depth, tau_board, tau_pv,
+            )
+
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        list(pool.map(_process, range(len(fens))))
+
+    scores: list[float] = []
+    qualifying: list[tuple[str, str]] = []
+    r_cnt_scores: list[float] = []
+    agg_debug: dict[str, float] = {}
+    for reward, is_novel, board_str, pv, gap, debug in results:
+        scores.append(reward)
+        if is_novel and board_str:
+            qualifying.append((board_str, pv))
+            r_cnt_scores.append(gap)
+        for k, v in debug.items():
+            agg_debug[k] = agg_debug.get(k, 0) + v
+
+    mean_gap = agg_debug.pop("gap_novel", 0.0)
+    n_novel = int(agg_debug.get("n_novel", 0))
+    agg_debug["mean_gap_novel"] = mean_gap / n_novel if n_novel > 0 else 0.0
+    debug_counts = {k: int(v) if k != "mean_gap_novel" else v for k, v in agg_debug.items()}
+    return torch.tensor(scores, dtype=torch.float32), qualifying, r_cnt_scores, debug_counts
+
+
 def main() -> None:
     """Run PPO RL training with HF Hub checkpoint pushing."""
     _start_health_server()
@@ -259,6 +308,16 @@ def main() -> None:
         or "/usr/bin/stockfish"
         or "/opt/homebrew/bin/stockfish"
     )
+
+    def _open_engine() -> chess.engine.SimpleEngine:
+        return chess.engine.SimpleEngine.popen_uci(stockfish_path)
+
+    def _close_engine(eng: chess.engine.SimpleEngine) -> None:
+        try:
+            eng.quit()
+        except Exception:
+            pass
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
     scaler = torch.cuda.amp.GradScaler() if use_amp else None
     step_start_time = time.time()
@@ -273,15 +332,29 @@ def main() -> None:
             all_qualifying: list[tuple[str, str]] = []
             agg_debug: dict[str, float] = {}
 
-            engine = chess.engine.SimpleEngine.popen_uci(stockfish_path)
+            # Generate all batches first (GPU), then analyse in parallel (CPU)
+            gen_batches: list[tuple[torch.Tensor, torch.Tensor, list[str]]] = []
+            for accum_idx in range(ACCUM_STEPS):
+                start_idx = torch.zeros((BATCH_SIZE, 1), dtype=torch.long, device=device)
+                with torch.no_grad(), autocast_ctx():
+                    seqs, old_lp = model.generate_with_log_probs(start_idx, max_new_tokens=83)
+                fens = decode_sequences(seqs, tokenizer)
+                gen_batches.append((seqs, old_lp, fens))
+
+            # Compute entropies for all sequences at once (GPU)
+            all_seqs_cat = torch.cat([b[0] for b in gen_batches], dim=0)
+            with torch.no_grad():
+                all_entropies: list[float] = model.compute_entropy(all_seqs_cat).tolist()
+
+            # Parallel Stockfish analysis using thread pool with per-thread engines
+            engines: list[chess.engine.SimpleEngine] = [_open_engine() for _ in range(NUM_STOCKFISH_WORKERS)]
+            engine_locks = [threading.Lock() for _ in range(NUM_STOCKFISH_WORKERS)]
+
             try:
-                for accum_idx in range(ACCUM_STEPS):
-                    start_idx = torch.zeros((BATCH_SIZE, 1), dtype=torch.long, device=device)
-                    with torch.no_grad(), autocast_ctx():
-                        seqs, old_lp = model.generate_with_log_probs(start_idx, max_new_tokens=83)
-                    fens = decode_sequences(seqs, tokenizer)
-                    rews, qualifying, r_cnt, dbg = compute_binary_rewards(
-                        fens, seqs, engine, replay_buffer, model,
+                for accum_idx, (seqs, old_lp, fens) in enumerate(gen_batches):
+                    ent_slice = all_entropies[accum_idx * BATCH_SIZE:(accum_idx + 1) * BATCH_SIZE]
+                    rews, qualifying, r_cnt, dbg = _parallel_compute_rewards(
+                        fens, seqs, engines, engine_locks, replay_buffer, ent_slice,
                         tau_board=TAU_BOARD, tau_pv=TAU_PV, tau_ent=TAU_ENT,
                         tau_uni=TAU_UNI, tactical_depth=TACTICAL_DEPTH,
                     )
@@ -296,10 +369,8 @@ def main() -> None:
                     for k, v in dbg.items():
                         agg_debug[k] = agg_debug.get(k, 0) + v
             finally:
-                try:
-                    engine.quit()
-                except Exception as e:
-                    _log(f"WARNING: engine.quit() failed at step {step}: {e}")
+                for eng in engines:
+                    _close_engine(eng)
 
             effective_bs = BATCH_SIZE * ACCUM_STEPS
             cat_sequences = torch.cat(all_sequences, dim=0)
@@ -329,12 +400,12 @@ def main() -> None:
                 optimizer.zero_grad()
                 ppo_loss_accum = 0.0
 
+                model.train()
                 for c in range(0, effective_bs, BATCH_SIZE):
                     chunk_seq = cat_sequences[c:c + BATCH_SIZE]
                     chunk_old_lp = cat_old_log_probs[c:c + BATCH_SIZE]
                     chunk_adv = advantages[c:c + BATCH_SIZE].detach()
 
-                    model.eval()
                     with autocast_ctx():
                         curr_lp = model.compute_log_probs(chunk_seq)
                         token_ratio = torch.exp(curr_lp - chunk_old_lp)
@@ -349,14 +420,12 @@ def main() -> None:
                         chunk_ppo.backward()
                     ppo_loss_accum += chunk_ppo.detach().item()
 
-                model.eval()
                 with autocast_ctx():
                     ent_logits = model.get_logits(cat_sequences[:BATCH_SIZE, :-1])
                     ent = -(torch.softmax(ent_logits, dim=-1) * torch.log_softmax(ent_logits, dim=-1)).sum(dim=-1)
                     ent_bonus = ent.mean()
                     ent_loss = -ENTROPY_COEFF * ent_bonus
 
-                model.train()
                 with autocast_ctx():
                     x_sl, y_sl = sl_batch[:, :-1], sl_batch[:, 1:]
                     _, sl_loss = model(x_sl, y_sl)
@@ -392,7 +461,7 @@ def main() -> None:
                 validity = (cat_rewards > -2).sum().item() / effective_bs
                 mean_kl = token_kl.mean().item()
 
-                true_puzzle_fens = [all_fens[i] for i in range(effective_bs) if cat_rewards[i].item() == 1.0]
+                true_puzzle_fens = [all_fens[i] for i in range(effective_bs) if cat_rewards[i].item() >= 0.9]
                 mean_r_cnt = sum(all_r_cnt) / len(all_r_cnt) if all_r_cnt else 0.0
                 examples_str = ""
                 if true_puzzle_fens:

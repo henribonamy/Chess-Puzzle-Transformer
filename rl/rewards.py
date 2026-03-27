@@ -151,6 +151,71 @@ def _analyse_position(
     return True, True, non_obvious, multi_move, pv, gap, w_deep, w2_deep
 
 
+def score_single_fen(
+    fen: str,
+    entropy: float,
+    engine: chess.engine.SimpleEngine,
+    replay_buffer: ReplayBuffer,
+    tau_ent: float,
+    tau_uni: float,
+    tactical_depth: int,
+    tau_board: int,
+    tau_pv: int,
+) -> tuple[float, bool, str, str, float, dict[str, int]]:
+    """Score a single FEN. Returns (reward, is_qualifying, board_str, pv, gap, debug_flags).
+
+    Thread-safe: only uses the passed engine instance.
+    """
+    debug = {"n_valid": 0, "n_unique": 0, "n_reversal": 0, "n_non_obvious": 0,
+             "n_multi": 0, "n_novel": 0, "n_unique_winning": 0, "n_balanced": 0,
+             "n_true_puzzles": 0, "gap_novel": 0.0}
+
+    if not is_valid_fen(fen):
+        return -2.0, False, "", "", 0.0, debug
+
+    if not is_realistic_piece_count(fen):
+        return 0.0, False, "", "", 0.0, debug
+
+    board = chess.Board(fen)
+    if not board.is_valid() or board.is_game_over():
+        return 0.0, False, "", "", 0.0, debug
+
+    if entropy < tau_ent:
+        return 0.0, False, "", "", 0.0, debug
+
+    debug["n_valid"] = 1
+    unique, eval_reversal, non_obvious, multi_move, pv, gap, w_deep, w2_deep = (
+        _analyse_position(board, engine, tactical_depth, tau_uni)
+    )
+    if not unique:
+        return gap * 0.3, False, "", "", gap, debug
+
+    debug["n_unique"] = 1
+    if w_deep >= 0.5:
+        debug["n_unique_winning"] = 1
+    if eval_reversal:
+        debug["n_reversal"] = 1
+    if non_obvious:
+        debug["n_non_obvious"] = 1
+    if multi_move:
+        debug["n_multi"] = 1
+
+    board_str = extract_board_position(fen)
+    is_novel = replay_buffer.is_novel(board_str, pv, tau_board, tau_pv)
+    if is_novel:
+        debug["n_novel"] = 1
+        debug["gap_novel"] = gap
+
+    if multi_move:
+        debug["n_true_puzzles"] = 1
+
+    reward = 0.3 * gap + 0.3 * float(eval_reversal) + 0.2 * float(non_obvious) + 0.2 * float(multi_move)
+    if not is_novel:
+        reward *= 0.7
+
+    return reward, is_novel, board_str, pv, gap, debug
+
+
 def compute_binary_rewards(
     fens: list[str],
     sequences: torch.Tensor,
@@ -165,11 +230,9 @@ def compute_binary_rewards(
 ) -> tuple[torch.Tensor, list[tuple[str, str]], list[float], dict[str, int]]:
     """Return rewards, qualifying positions, r_cnt scores, and per-filter debug counts.
 
-    Three-tier reward with proximity shaping:
-      - True puzzle (eval reversal + move disagree): 1.0
-      - Eval reversal only (trivial capture or depth-1 agrees): 0.7
-      - Unique + novel, no reversal: proximity-shaped 0.0–0.4
-    debug_counts keys: n_valid, n_unique, n_reversal, n_counter, n_novel, n_true_puzzles.
+    Shaped reward: 0.3*gap + 0.3*reversal + 0.2*non_obvious + 0.2*multi_move
+    gives a smooth gradient toward puzzle-like positions instead of sparse tiers.
+    debug_counts keys: n_valid, n_unique, n_reversal, n_non_obvious, n_multi, n_novel, n_true_puzzles.
     """
     scores: list[float] = []
     qualifying: list[tuple[str, str]] = []
@@ -228,15 +291,11 @@ def compute_binary_rewards(
 
         if multi_move:
             n_true_puzzles += 1
-            reward = 1.0
-        elif non_obvious:
-            reward = 0.8
-        elif eval_reversal:
-            reward = 0.0
-        else:
-            reward = gap * 0.5
+
+        # Shaped reward: smooth gradient toward better puzzles
+        reward = 0.3 * gap + 0.3 * float(eval_reversal) + 0.2 * float(non_obvious) + 0.2 * float(multi_move)
         if not is_novel:
-            reward *= 0.3
+            reward *= 0.7
         scores.append(reward)
 
     mean_gap_novel = gap_novel_sum / n_novel if n_novel > 0 else 0.0
