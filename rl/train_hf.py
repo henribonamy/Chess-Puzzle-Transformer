@@ -37,7 +37,7 @@ SL_COEFF = 0.0
 ENTROPY_COEFF = 0.0
 NUM_STEPS = 1000
 LOG_INTERVAL = 10
-CHECKPOINT_INTERVAL = 100
+CHECKPOINT_INTERVAL = 50
 DATA_MIX_SIZE = 100_000
 REPLAY_BUFFER_SIZE = 10_000
 BUFFER_SEED_SIZE = 10_000
@@ -104,6 +104,32 @@ def ensure_pretrained_checkpoint() -> None:
         local_dir="outputs",
     )
     os.rename("outputs/model_checkpoint_finetuned.pt", PRETRAINED_CHECKPOINT_PATH)
+
+
+def find_latest_rl_checkpoint() -> tuple[str | None, int]:
+    """Return (local_path, step) of the latest RL checkpoint from HF Hub, or (None, 0)."""
+    api = HfApi()
+    try:
+        files = api.list_repo_files(HF_RL_REPO, repo_type="model")
+    except Exception:
+        return None, 0
+    rl_files = [f for f in files if f.startswith("rl_step_") and f.endswith(".pt")]
+    if not rl_files:
+        return None, 0
+    # parse step numbers and find max
+    def _step(f: str) -> int:
+        try:
+            return int(f.replace("rl_step_", "").replace(".pt", ""))
+        except ValueError:
+            return 0
+    latest = max(rl_files, key=_step)
+    step = _step(latest)
+    local_path = os.path.join(RL_CHECKPOINT_DIR, latest)
+    if not os.path.exists(local_path):
+        os.makedirs(RL_CHECKPOINT_DIR, exist_ok=True)
+        print(f"Resuming from RL checkpoint {latest} (step {step})...")
+        hf_hub_download(repo_id=HF_RL_REPO, filename=latest, local_dir=RL_CHECKPOINT_DIR)
+    return local_path, step
 
 
 def push_checkpoint_to_hub(local_path: str, filename: str) -> None:
@@ -207,9 +233,16 @@ def main() -> None:
     seed_replay_buffer(replay_buffer, dataset, tokenizer, BUFFER_SEED_SIZE)
 
     model = AutoRegressiveTransformer().to(device)
-    state_dict = torch.load(PRETRAINED_CHECKPOINT_PATH, map_location=device)
-    model.load_state_dict(state_dict)
-    _log(f"Loaded pretrained checkpoint from {PRETRAINED_CHECKPOINT_PATH}")
+    rl_ckpt_path, resume_step = find_latest_rl_checkpoint()
+    if rl_ckpt_path:
+        state_dict = torch.load(rl_ckpt_path, map_location=device)
+        model.load_state_dict(state_dict)
+        _log(f"Resumed from RL checkpoint {rl_ckpt_path} (step {resume_step})")
+    else:
+        state_dict = torch.load(PRETRAINED_CHECKPOINT_PATH, map_location=device)
+        model.load_state_dict(state_dict)
+        resume_step = 0
+        _log(f"Loaded pretrained checkpoint from {PRETRAINED_CHECKPOINT_PATH}")
 
     ref_model = AutoRegressiveTransformer().to(device)
     ref_model.load_state_dict(model.state_dict())
@@ -237,7 +270,7 @@ def main() -> None:
     step_start_time = time.time()
 
     try:
-        for step in range(NUM_STEPS):
+        for step in range(resume_step, NUM_STEPS):
             all_sequences: list[torch.Tensor] = []
             all_old_log_probs: list[torch.Tensor] = []
             all_rewards: list[torch.Tensor] = []
