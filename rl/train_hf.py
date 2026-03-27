@@ -11,7 +11,6 @@ import numpy as np
 import torch
 import chess
 import chess.engine
-import trackio
 from huggingface_hub import HfApi, hf_hub_download
 from tqdm import tqdm
 
@@ -27,8 +26,6 @@ from replay_buffer import ReplayBuffer
 HF_PRETRAINED_REPO = "henribonamy/chess-puzzles-pretrained"
 HF_RL_REPO = "henribonamy/chess-puzzles-rl"
 HF_DATA_REPO = "henribonamy/chess-puzzles-data"
-HF_TRACKIO_SPACE = "henribonamy/chess-puzzles-trackio"
-TRACKIO_PROJECT = "chess-puzzles-rl"
 
 BATCH_SIZE = 64
 ACCUM_STEPS = 4
@@ -186,13 +183,11 @@ def _start_health_server() -> None:
 
 
 def main() -> None:
-    """Run PPO RL training with trackio logging and HF Hub checkpoint pushing."""
+    """Run PPO RL training with HF Hub checkpoint pushing."""
     _start_health_server()
     ensure_data()
     ensure_high_rated_indices()
     ensure_pretrained_checkpoint()
-
-    trackio.init(TRACKIO_PROJECT, space_id=HF_TRACKIO_SPACE)
 
     if torch.cuda.is_available():
         device = torch.device("cuda")
@@ -377,30 +372,6 @@ def main() -> None:
                     examples_str += "\n           MULTI-MOVE PUZZLES:\n" + "\n".join(f"             {f}" for f in true_puzzle_fens[:3])
 
                 debug_counts = {k: (v / ACCUM_STEPS if k.startswith("mean") else v) for k, v in agg_debug.items()}
-
-                trackio.log({
-                    "loss": last_loss.item(),
-                    "ppo_loss": last_ppo_loss.item(),
-                    "kl": mean_kl,
-                    "sl_loss": last_sl_loss.item(),
-                    "entropy": last_ent_bonus.item(),
-                    "reward_mean": mean_reward,
-                    "reward_std": reward_std,
-                    "puzzle_rate": puzzle_rate * 100,
-                    "validity": validity * 100,
-                    "n_qualifying": n_pos,
-                    "n_illegal": n_illegal,
-                    "mean_r_cnt": mean_r_cnt,
-                    "n_unique_winning": debug_counts.get("n_unique_winning", 0),
-                    "n_reversal": debug_counts.get("n_reversal", 0),
-                    "n_non_obvious": debug_counts.get("n_non_obvious", 0),
-                    "n_multi": debug_counts.get("n_multi", 0),
-                    "mean_gap": debug_counts.get("mean_gap_novel", 0),
-                    "n_balanced": debug_counts.get("n_balanced", 0),
-                    "n_true_puzzles": debug_counts.get("n_true_puzzles", 0),
-                    "replay_buffer_size": len(replay_buffer),
-                    "step": step,
-                })
 
                 _log(
                     f"Step {step:4d} | Loss: {last_loss.item():.4f} | Reward: {mean_reward:.4f} ± {reward_std:.4f} | "
