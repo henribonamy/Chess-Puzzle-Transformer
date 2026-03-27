@@ -210,8 +210,6 @@ def score_single_fen(
         debug["n_true_puzzles"] = 1
 
     reward = 0.3 * gap + 0.3 * float(eval_reversal) + 0.2 * float(non_obvious) + 0.2 * float(multi_move)
-    if not is_novel:
-        reward *= 0.7
 
     return reward, is_novel, board_str, pv, gap, debug
 
@@ -294,8 +292,6 @@ def compute_binary_rewards(
 
         # Shaped reward: smooth gradient toward better puzzles
         reward = 0.3 * gap + 0.3 * float(eval_reversal) + 0.2 * float(non_obvious) + 0.2 * float(multi_move)
-        if not is_novel:
-            reward *= 0.7
         scores.append(reward)
 
     mean_gap_novel = gap_novel_sum / n_novel if n_novel > 0 else 0.0
