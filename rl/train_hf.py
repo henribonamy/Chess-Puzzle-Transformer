@@ -28,8 +28,8 @@ HF_PRETRAINED_REPO = "henribonamy/chess-puzzles-pretrained"
 HF_RL_REPO = "henribonamy/chess-puzzles-rl"
 HF_DATA_REPO = "henribonamy/chess-puzzles-data"
 
-BATCH_SIZE = 64
-ACCUM_STEPS = 4
+BATCH_SIZE = 256
+ACCUM_STEPS = 1
 LR = 1e-6
 PPO_EPOCHS = 4
 PPO_EPS = 0.2
