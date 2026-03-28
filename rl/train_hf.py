@@ -410,7 +410,6 @@ def main() -> None:
             last_sl_loss = torch.tensor(0.0)
             last_ent_bonus = torch.tensor(0.0)
             last_loss = torch.tensor(0.0)
-            token_kl = torch.zeros(effective_bs)
 
             optimizer.zero_grad()
             model.train()
