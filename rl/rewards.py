@@ -188,7 +188,7 @@ def score_single_fen(
         _analyse_position(board, engine, tactical_depth, tau_uni)
     )
     if not unique:
-        return gap * 0.3, False, "", "", gap, debug
+        return 0.0, False, "", "", gap, debug
 
     debug["n_unique"] = 1
     if w_deep >= 0.5:
@@ -267,7 +267,7 @@ def compute_binary_rewards(
             _analyse_position(board, engine, tactical_depth, tau_uni)
         )
         if not unique:
-            scores.append(gap * 0.3)
+            scores.append(0.0)
             continue
 
         n_unique += 1
