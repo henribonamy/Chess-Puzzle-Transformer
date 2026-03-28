@@ -392,7 +392,7 @@ def main() -> None:
                     kl_chunks.append((pol_c - ref_c).mean(dim=-1))
             token_kl = torch.cat(kl_chunks, dim=0)
             shaped_rewards = cat_rewards - KL_COEFF * token_kl
-            advantages = (shaped_rewards - shaped_rewards.mean()) / (shaped_rewards.std() + 1e-8)
+            advantages = shaped_rewards.clamp(-2.0, 2.0)  # raw rewards as advantages, no normalization
 
             sl_batch = sample_sl_batch(dataset, sl_indices, BATCH_SIZE, device)
 
