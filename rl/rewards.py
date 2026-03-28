@@ -210,7 +210,7 @@ def score_single_fen(
         debug["n_true_puzzles"] = 1
 
     if not non_obvious:
-        return -0.1, False, board_str, pv, gap, debug
+        return 0.05 * gap, False, board_str, pv, gap, debug
 
     reward = 0.5 * gap + 0.2 * float(eval_reversal) + 0.3 * float(multi_move)
 
@@ -294,7 +294,7 @@ def compute_binary_rewards(
             n_true_puzzles += 1
 
         if not non_obvious:
-            scores.append(-0.1)
+            scores.append(0.05 * gap)
             continue
 
         reward = 0.5 * gap + 0.2 * float(eval_reversal) + 0.3 * float(multi_move)
