@@ -41,7 +41,7 @@ PPO_EPOCHS = 1
 PPO_EPS = 0.1
 KL_COEFF = 0.5
 SL_COEFF = 0.1
-ENTROPY_COEFF = 0.05
+ENTROPY_COEFF = 0.01
 NUM_STEPS = 1000
 LOG_INTERVAL = 10
 CHECKPOINT_INTERVAL = 100
@@ -386,6 +386,17 @@ def main() -> None:
             # boring valid positions (reward=-0.1) get slightly negative advantage,
             # puzzles get positive advantage, and invalid FENs (reward=-2) are excluded
             # to prevent their large gradient from dominating.
+            # KL penalty against reference model to anchor policy
+            model.eval()
+            kl_chunks = []
+            with torch.no_grad(), autocast_ctx():
+                for c in range(0, effective_bs, BATCH_SIZE):
+                    chunk = cat_sequences[c:c + BATCH_SIZE]
+                    ref_c = ref_model.compute_log_probs(chunk)
+                    pol_c = model.compute_log_probs(chunk)
+                    kl_chunks.append((pol_c - ref_c).mean(dim=-1))
+            token_kl = torch.cat(kl_chunks, dim=0)
+
             valid_mask = cat_rewards > -2.0
             advantages = torch.zeros(effective_bs, device=device)
             if valid_mask.sum() > 1:
@@ -417,7 +428,8 @@ def main() -> None:
             with autocast_ctx():
                 x_sl, y_sl = sl_batch[:, :-1], sl_batch[:, 1:]
                 _, sl_loss = model(x_sl, y_sl)
-                total_loss = reinforce_loss + ent_loss + SL_COEFF * sl_loss
+                kl_loss = KL_COEFF * token_kl.mean()
+                total_loss = reinforce_loss + ent_loss + kl_loss + SL_COEFF * sl_loss
 
             if scaler is not None:
                 scaler.scale(total_loss).backward()
