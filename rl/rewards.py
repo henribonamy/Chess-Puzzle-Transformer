@@ -174,11 +174,11 @@ def score_single_fen(
         return -2.0, False, "", "", 0.0, debug
 
     if not is_realistic_piece_count(fen):
-        return 0.0, False, "", "", 0.0, debug
+        return -1.0, False, "", "", 0.0, debug
 
     board = chess.Board(fen)
     if not board.is_valid() or board.is_game_over():
-        return 0.0, False, "", "", 0.0, debug
+        return -1.0, False, "", "", 0.0, debug
 
     if entropy < tau_ent:
         return 0.0, False, "", "", 0.0, debug
@@ -250,12 +250,12 @@ def compute_binary_rewards(
             continue
 
         if not is_realistic_piece_count(fen):
-            scores.append(0.0)
+            scores.append(-1.0)
             continue
 
         board = chess.Board(fen)
         if not board.is_valid() or board.is_game_over():
-            scores.append(0.0)
+            scores.append(-1.0)
             continue
 
         if entropies[i] < tau_ent:
