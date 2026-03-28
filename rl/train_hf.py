@@ -409,11 +409,15 @@ def main() -> None:
                 curr_lp = model.compute_log_probs(cat_sequences)  # (bs, T)
                 seq_lp = curr_lp.mean(dim=-1)                     # mean log-prob per sequence
                 reinforce_loss = -(advantages.detach() * seq_lp).mean()
+                ent_logits = model.get_logits(cat_sequences[:, :-1])
+                ent = -(torch.softmax(ent_logits, dim=-1) * torch.log_softmax(ent_logits, dim=-1)).sum(dim=-1)
+                ent_bonus = ent.mean()
+                ent_loss = -ENTROPY_COEFF * ent_bonus
 
             with autocast_ctx():
                 x_sl, y_sl = sl_batch[:, :-1], sl_batch[:, 1:]
                 _, sl_loss = model(x_sl, y_sl)
-                total_loss = reinforce_loss + SL_COEFF * sl_loss
+                total_loss = reinforce_loss + ent_loss + SL_COEFF * sl_loss
 
             if scaler is not None:
                 scaler.scale(total_loss).backward()
@@ -428,6 +432,7 @@ def main() -> None:
 
             last_ppo_loss = reinforce_loss.detach()
             last_sl_loss = sl_loss.detach()
+            last_ent_bonus = ent_bonus.detach()
             last_loss = total_loss.detach()
 
             if step % LOG_INTERVAL == 0:
