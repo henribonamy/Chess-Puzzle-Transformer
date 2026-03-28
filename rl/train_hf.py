@@ -379,78 +379,57 @@ def main() -> None:
 
             effective_bs = BATCH_SIZE * ACCUM_STEPS
             cat_sequences = torch.cat(all_sequences, dim=0)
-            cat_old_log_probs = torch.cat(all_old_log_probs, dim=0)
             cat_rewards = torch.cat(all_rewards, dim=0)
 
-            model.eval()
-            kl_chunks = []
-            with torch.no_grad(), autocast_ctx():
-                for c in range(0, effective_bs, BATCH_SIZE):
-                    chunk = cat_sequences[c:c + BATCH_SIZE]
-                    ref_c = ref_model.compute_log_probs(chunk)
-                    pol_c = model.compute_log_probs(chunk)
-                    kl_chunks.append((pol_c - ref_c).mean(dim=-1))
-            token_kl = torch.cat(kl_chunks, dim=0)
-            shaped_rewards = cat_rewards - KL_COEFF * token_kl
-            advantages = shaped_rewards.clamp(-2.0, 2.0)  # raw rewards as advantages, no normalization
+            # Rejection sampling fine-tuning (ReST):
+            # Fine-tune only on sequences that Stockfish confirmed as puzzles (reward >= threshold).
+            # Plain cross-entropy on high-reward samples + SL mixture. No PPO, no collapse.
+            REWARD_THRESHOLD = 0.3  # eval_reversal + non_obvious gives >= 0.5; reversal-only >= 0.3
+            puzzle_mask = cat_rewards >= REWARD_THRESHOLD
+            n_puzzles = puzzle_mask.sum().item()
 
             sl_batch = sample_sl_batch(dataset, sl_indices, BATCH_SIZE, device)
 
-            last_ppo_loss = torch.tensor(0.0)
+            last_rl_loss = torch.tensor(0.0)
             last_sl_loss = torch.tensor(0.0)
-            last_ent_bonus = torch.tensor(0.0)
             last_loss = torch.tensor(0.0)
 
-            for _ in range(PPO_EPOCHS):
-                optimizer.zero_grad()
-                ppo_loss_accum = 0.0
+            optimizer.zero_grad()
+            model.train()
 
-                model.train()
-                for c in range(0, effective_bs, BATCH_SIZE):
-                    chunk_seq = cat_sequences[c:c + BATCH_SIZE]
-                    chunk_old_lp = cat_old_log_probs[c:c + BATCH_SIZE]
-                    chunk_adv = advantages[c:c + BATCH_SIZE].detach()
-
-                    with autocast_ctx():
-                        curr_lp = model.compute_log_probs(chunk_seq)
-                        token_ratio = torch.exp(curr_lp - chunk_old_lp)
-                        adv_expanded = chunk_adv.unsqueeze(1)
-                        surr1 = token_ratio * adv_expanded
-                        surr2 = torch.clamp(token_ratio, 1 - PPO_EPS, 1 + PPO_EPS) * adv_expanded
-                        chunk_ppo = -torch.min(surr1, surr2).mean() / ACCUM_STEPS
-
-                    if scaler is not None:
-                        scaler.scale(chunk_ppo).backward()
-                    else:
-                        chunk_ppo.backward()
-                    ppo_loss_accum += chunk_ppo.detach().item()
-
+            if n_puzzles > 0:
+                puzzle_seqs = cat_sequences[puzzle_mask]
                 with autocast_ctx():
-                    ent_logits = model.get_logits(cat_sequences[:BATCH_SIZE, :-1])
-                    ent = -(torch.softmax(ent_logits, dim=-1) * torch.log_softmax(ent_logits, dim=-1)).sum(dim=-1)
-                    ent_bonus = ent.mean()
-                    ent_loss = -ENTROPY_COEFF * ent_bonus
-
-                with autocast_ctx():
-                    x_sl, y_sl = sl_batch[:, :-1], sl_batch[:, 1:]
-                    _, sl_loss = model(x_sl, y_sl)
-                    aux_loss = ent_loss + SL_COEFF * sl_loss
-
+                    x_rl, y_rl = puzzle_seqs[:, :-1], puzzle_seqs[:, 1:]
+                    _, rl_loss = model(x_rl, y_rl)
                 if scaler is not None:
-                    scaler.scale(aux_loss).backward()
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    scaler.step(optimizer)
-                    scaler.update()
+                    scaler.scale(rl_loss).backward()
                 else:
-                    aux_loss.backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    optimizer.step()
+                    rl_loss.backward()
+                last_rl_loss = rl_loss.detach()
 
-                last_ppo_loss = torch.tensor(ppo_loss_accum)
-                last_sl_loss = sl_loss.detach()
-                last_ent_bonus = ent_bonus.detach()
-                last_loss = torch.tensor(ppo_loss_accum + SL_COEFF * sl_loss.item() - ENTROPY_COEFF * ent_bonus.item())
+            with autocast_ctx():
+                x_sl, y_sl = sl_batch[:, :-1], sl_batch[:, 1:]
+                _, sl_loss = model(x_sl, y_sl)
+                sl_loss_scaled = SL_COEFF * sl_loss
+
+            if scaler is not None:
+                scaler.scale(sl_loss_scaled).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                sl_loss_scaled.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+
+            last_sl_loss = sl_loss.detach()
+            last_loss = torch.tensor(last_rl_loss.item() + SL_COEFF * last_sl_loss.item())
+            # Dummy values for logging compat
+            last_ppo_loss = last_rl_loss
+            last_ent_bonus = torch.tensor(0.0)
+            token_kl = torch.zeros(effective_bs)
 
             if step % LOG_INTERVAL == 0:
                 now = time.time()
