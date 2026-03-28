@@ -379,57 +379,56 @@ def main() -> None:
 
             effective_bs = BATCH_SIZE * ACCUM_STEPS
             cat_sequences = torch.cat(all_sequences, dim=0)
+            cat_old_log_probs = torch.cat(all_old_log_probs, dim=0)
             cat_rewards = torch.cat(all_rewards, dim=0)
 
-            # Rejection sampling fine-tuning (ReST):
-            # Fine-tune only on sequences that Stockfish confirmed as puzzles (reward >= threshold).
-            # Plain cross-entropy on high-reward samples + SL mixture. No PPO, no collapse.
-            REWARD_THRESHOLD = 0.3  # eval_reversal + non_obvious gives >= 0.5; reversal-only >= 0.3
-            puzzle_mask = cat_rewards >= REWARD_THRESHOLD
-            n_puzzles = puzzle_mask.sum().item()
+            # REINFORCE: normalize advantages within the non-invalid subset so that
+            # boring valid positions (reward=-0.1) get slightly negative advantage,
+            # puzzles get positive advantage, and invalid FENs (reward=-2) are excluded
+            # to prevent their large gradient from dominating.
+            valid_mask = cat_rewards > -2.0
+            advantages = torch.zeros(effective_bs, device=device)
+            if valid_mask.sum() > 1:
+                valid_r = cat_rewards[valid_mask]
+                norm_r = (valid_r - valid_r.mean()) / (valid_r.std() + 1e-8)
+                advantages[valid_mask] = norm_r
 
             sl_batch = sample_sl_batch(dataset, sl_indices, BATCH_SIZE, device)
 
-            last_rl_loss = torch.tensor(0.0)
+            last_ppo_loss = torch.tensor(0.0)
             last_sl_loss = torch.tensor(0.0)
+            last_ent_bonus = torch.tensor(0.0)
             last_loss = torch.tensor(0.0)
+            token_kl = torch.zeros(effective_bs)
 
             optimizer.zero_grad()
             model.train()
 
-            if n_puzzles > 0:
-                puzzle_seqs = cat_sequences[puzzle_mask]
-                with autocast_ctx():
-                    x_rl, y_rl = puzzle_seqs[:, :-1], puzzle_seqs[:, 1:]
-                    _, rl_loss = model(x_rl, y_rl)
-                if scaler is not None:
-                    scaler.scale(rl_loss).backward()
-                else:
-                    rl_loss.backward()
-                last_rl_loss = rl_loss.detach()
+            # REINFORCE policy gradient: -E[advantage * log_prob(sequence)]
+            with autocast_ctx():
+                curr_lp = model.compute_log_probs(cat_sequences)  # (bs, T)
+                seq_lp = curr_lp.mean(dim=-1)                     # mean log-prob per sequence
+                reinforce_loss = -(advantages.detach() * seq_lp).mean()
 
             with autocast_ctx():
                 x_sl, y_sl = sl_batch[:, :-1], sl_batch[:, 1:]
                 _, sl_loss = model(x_sl, y_sl)
-                sl_loss_scaled = SL_COEFF * sl_loss
+                total_loss = reinforce_loss + SL_COEFF * sl_loss
 
             if scaler is not None:
-                scaler.scale(sl_loss_scaled).backward()
+                scaler.scale(total_loss).backward()
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                sl_loss_scaled.backward()
+                total_loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
 
+            last_ppo_loss = reinforce_loss.detach()
             last_sl_loss = sl_loss.detach()
-            last_loss = torch.tensor(last_rl_loss.item() + SL_COEFF * last_sl_loss.item())
-            # Dummy values for logging compat
-            last_ppo_loss = last_rl_loss
-            last_ent_bonus = torch.tensor(0.0)
-            token_kl = torch.zeros(effective_bs)
+            last_loss = total_loss.detach()
 
             if step % LOG_INTERVAL == 0:
                 now = time.time()
