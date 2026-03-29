@@ -212,7 +212,7 @@ def score_single_fen(
     if not non_obvious:
         return 0.05 * gap, False, board_str, pv, gap, debug
 
-    reward = 0.5 * gap + 0.2 * float(eval_reversal) + 0.3 * float(multi_move)
+    reward = 0.5 * gap + 0.2 * float(eval_reversal) + 0.05 * float(multi_move)
     if not is_novel:
         reward *= 0.1  # heavy discount for repeated positions
 
@@ -299,7 +299,7 @@ def compute_binary_rewards(
             scores.append(0.05 * gap)
             continue
 
-        reward = 0.5 * gap + 0.2 * float(eval_reversal) + 0.3 * float(multi_move)
+        reward = 0.5 * gap + 0.2 * float(eval_reversal) + 0.05 * float(multi_move)
         if not is_novel:
             reward *= 0.1  # heavy discount for repeated positions
         scores.append(reward)
